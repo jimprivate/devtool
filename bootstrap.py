@@ -23,7 +23,7 @@ from pathlib import Path
 # ============================================================
 
 GITHUB_USER = "jimprivate"
-GITHUB_REPO = "tools"
+GITHUB_REPO = "devtool"
 GITHUB_BRANCH = "main"
 TOOLS_SUBDIR = "tools"
 

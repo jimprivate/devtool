@@ -22,7 +22,7 @@ if (-not $py) {
 Write-Host "[+] Python: $((Get-Command $py).Source)"
 
 # Download and run bootstrap from GitHub
-$url = "https://raw.githubusercontent.com/jimprivate/tools/main/bootstrap.py"
+$url = "https://raw.githubusercontent.com/jimprivate/devtool/main/bootstrap.py"
 $tmp = "$env:TEMP\w11-bootstrap.py"
 Write-Host "[+] Fetching bootstrap from GitHub..."
 Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing

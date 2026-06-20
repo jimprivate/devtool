@@ -27,7 +27,7 @@ fi
 echo -e "${GREEN}[+]${NC} Python: $(command -v "$PY")"
 
 # Download and run bootstrap from GitHub
-URL="https://raw.githubusercontent.com/jimprivate/tools/main/bootstrap.py"
+URL="https://raw.githubusercontent.com/jimprivate/devtool/main/bootstrap.py"
 TMP="/tmp/w11-bootstrap.py"
 echo "[+] Fetching bootstrap from GitHub..."
 curl -fsSL "$URL" -o "$TMP"
