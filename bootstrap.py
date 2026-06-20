@@ -225,23 +225,36 @@ def install_launchers():
 # PATH warning
 # ============================================================
 
-def warn_path():
+def set_path():
     bd = bin_dir()
     cur = os.environ.get("PATH", "")
     sep = ";" if platform.system() == "Windows" else ":"
     if str(bd) in cur.split(sep):
         return
     print()
-    print(f"[!] {bd} not on PATH for this session.")
+    print(f"[+] Adding {bd} to PATH...")
     if platform.system() == "Windows":
-        print("    Run once to persist (PowerShell Admin):")
-        print(f'      [Environment]::SetEnvironmentVariable("PATH", $env:PATH + ";{bd}", "User")')
+        import subprocess as _sub
+        user_path = _sub.run(
+            ["powershell", "-NoProfile", "-Command",
+             "[Environment]::GetEnvironmentVariable('Path','User')"],
+            capture_output=True, text=True).stdout.strip()
+        new_path = user_path + ";" + str(bd) if user_path else str(bd)
+        _sub.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"[Environment]::SetEnvironmentVariable('Path', '{new_path}', 'User')"],
+            check=True, capture_output=True)
+        os.environ["PATH"] = cur + sep + str(bd)
+        print(f"    Done. Restart your terminal to use the tools.")
     else:
         rc = Path.home() / (".zshrc" if (Path.home() / ".zshrc").exists() else ".bashrc")
-        print(f"    Add to {rc}:")
-        print(f'      export PATH="$PATH:{bd}"')
-        print(f"    Then:  source {rc}")
-    print()
+        line = f'\nexport PATH="$PATH:{bd}"\n'
+        existing = rc.read_text() if rc.exists() else ""
+        if line.strip() not in existing:
+            rc.write_text(existing + line)
+            print(f"    Added to {rc}. Run:  source {rc}")
+        else:
+            print(f"    Already in {rc}.")
 
 # ============================================================
 # Main
@@ -253,7 +266,7 @@ def main():
     ensure_git()
     pull_tools()
     names = install_launchers()
-    warn_path()
+    set_path()
 
     print("[bootstrap] Done. Open a new terminal and run:")
     for n in names:
