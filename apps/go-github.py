@@ -2,25 +2,65 @@
 """Unified GitHub CLI — push, pull, new repo, init repo."""
 
 import argparse
+import json
 import os
+import platform
+import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 GITHUB_API = "https://api.github.com"
 
 
+def _config_dir():
+    if platform.system() == "Windows":
+        base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+    else:
+        base = Path.home() / ".config"
+    return base / "go-github"
+
+
+def _token_file():
+    return _config_dir() / "token"
+
+
 def get_token():
-    token = os.environ.get("GITHUB_TOKEN")
+    """Read token from disk, prompt and cache if missing."""
+    tf = _token_file()
+    if tf.exists():
+        token = tf.read_text().strip()
+        if token:
+            return token
+
+    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    if token:
+        return token
+
+    token = input("GitHub token: ").strip()
     if not token:
-        print("[!] GITHUB_TOKEN not set.")
-        print("    Set it via:  export GITHUB_TOKEN=your_token_here")
+        print("[!] Token required. Get one at: https://github.com/settings/tokens (scope: repo)")
         sys.exit(1)
+
+    tf.parent.mkdir(parents=True, exist_ok=True)
+    tf.write_text(token)
+    tf.chmod(0o600)
+    print(f"[+] Token saved to {tf}")
+    os.environ["GITHUB_TOKEN"] = token
     return token
 
 
+class HttpError(Exception):
+    def __init__(self, status: int, body: str):
+        self.status = status
+        self.body = body
+        super().__init__(f"HTTP {status}: {body}")
+
+
 def http_get(url, token, params=None):
-    import urllib.request, urllib.parse
     if params:
         url += "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={
@@ -28,12 +68,22 @@ def http_get(url, token, params=None):
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     })
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read()
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode(errors="replace")
+        raise HttpError(e.code, body_text) from e
+
+
+class HttpError(Exception):
+    def __init__(self, status: int, body: str):
+        self.status = status
+        self.body = body
+        super().__init__(f"HTTP {status}: {body}")
 
 
 def http_post(url, token, data):
-    import urllib.request, json
     body = json.dumps(data).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Authorization": f"Bearer {token}",
@@ -41,8 +91,12 @@ def http_post(url, token, data):
         "Content-Type": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     })
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return r.read()
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode(errors="replace")
+        raise HttpError(e.code, body_text) from e
 
 
 def find_repo_root(start: Path) -> Path | None:
@@ -84,14 +138,25 @@ def cmd_status(repo: Path):
 
 def cmd_pull(repo: Path, msg: str):
     """Git pull."""
-    result = subprocess.run(
-        ["git", "-C", str(repo), "pull"],
+    result = subprocess.run(["git", "-C", str(repo), "pull"])
+    if result.returncode != 0:
+        print("[!] Pull failed.")
+
+
+def _get_remote_url(repo: Path) -> str | None:
+    """Get origin remote URL if set."""
+    r = subprocess.run(
+        ["git", "-C", str(repo), "remote", "get-url", "origin"],
         capture_output=True, text=True
     )
-    if result.returncode == 0:
-        print(result.stdout or "[+] Pulled.")
-    else:
-        print(f"[!] Pull failed: {result.stderr}")
+    if r.returncode == 0:
+        url = r.stdout.strip()
+        # Convert git@github.com:user/repo.git to https://github.com/user/repo
+        if url.startswith("git@github.com:"):
+            return "https://github.com/" + url.split(":", 1)[1].removesuffix(".git")
+        if url.startswith("https://") or url.startswith("http://"):
+            return url.removesuffix(".git")
+    return None
 
 
 def cmd_push(repo: Path, msg: str):
@@ -108,21 +173,21 @@ def cmd_push(repo: Path, msg: str):
     print(f"[+] Committing in {repo.name}...")
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", msg], check=True, capture_output=True)
-    push = subprocess.run(
-        ["git", "-C", str(repo), "push"],
-        capture_output=True, text=True
-    )
-    print(push.stdout or "[+] Pushed.")
-    if push.returncode != 0:
-        print(f"[!] Push failed: {push.stderr}")
+    push = subprocess.run(["git", "-C", str(repo), "push"])
+    if push.returncode == 0:
+        web_url = _get_remote_url(repo)
+        print(f"[+] Pushed.")
+        if web_url:
+            print(f"  -> {web_url}")
+    else:
+        print(f"[!] Push failed.")
 
 
-def cmd_new(repo_name: str, private: bool = True):
-    """Create a GitHub repo without cloning."""
+def cmd_new(repo_name: str, private: bool = True, push_local: bool = False):
+    """Create a GitHub repo. Optionally push local files from current dir."""
     token = get_token()
     user_url = f"{GITHUB_API}/user"
     user_data = http_get(user_url, token)
-    import json
     username = json.loads(user_data)["login"]
 
     create_url = f"{GITHUB_API}/user/repos"
@@ -135,19 +200,37 @@ def cmd_new(repo_name: str, private: bool = True):
     try:
         http_post(create_url, token, data)
         print(f"[+] Created: https://github.com/{username}/{repo_name} ({'private' if private else 'public'})")
-    except Exception as e:
-        if "already exists" in str(e):
-            print(f"[!] Repo '{username}/{repo_name}' already exists.")
+    except HttpError as e:
+        if "already exists" in e.body:
+            print(f"[!] Repo '{username}/{repo_name}' already exists on GitHub.")
+            if not push_local:
+                print("Aborted.")
+                return
+            confirm = input("  Push to it anyway? [y/N]: ").strip().lower()
+            if confirm != "y":
+                print("Aborted.")
+                return
+            print("[i] Continuing with existing repo.")
+        elif e.status == 422:
+            try:
+                msg = json.loads(e.body).get("errors", [{}])[0].get("message", e.body)
+            except Exception:
+                msg = e.body
+            print(f"[!] 422 Unprocessable Entity: {msg}")
+            return
         else:
-            print(f"[!] Failed to create repo: {e}")
+            print(f"[!] API error {e.status}: {e.body}")
+            return
+
+    if push_local:
+        _push_local(Path.cwd(), username, repo_name)
 
 
-def cmd_init(repo_name: str, private: bool = True):
+def cmd_init(repo_name: str, private: bool = True, push_local: bool = True):
     """Create GitHub repo, git init, first commit + push."""
     token = get_token()
     user_url = f"{GITHUB_API}/user"
     user_data = http_get(user_url, token)
-    import json
     username = json.loads(user_data)["login"]
 
     # Create GitHub repo
@@ -156,59 +239,129 @@ def cmd_init(repo_name: str, private: bool = True):
         http_post(create_url, token, {
             "name": repo_name,
             "private": private,
-            "auto_init": True,
+            "auto_init": False,
             "description": "",
         })
         print(f"[+] Created GitHub repo: https://github.com/{username}/{repo_name}")
-    except Exception as e:
-        if "already exists" not in str(e):
-            print(f"[!] Failed to create repo: {e}")
+    except HttpError as e:
+        if "already exists" in e.body:
+            print(f"[!] Repo '{username}/{repo_name}' already exists on GitHub.")
+            confirm = input("  Use existing repo and push local files? [y/N]: ").strip().lower()
+            if confirm != "y":
+                print("Aborted.")
+                return
+            print("[i] Continuing with existing repo...")
+        elif e.status == 422:
+            try:
+                msg = json.loads(e.body).get("errors", [{}])[0].get("message", e.body)
+            except Exception:
+                msg = e.body
+            print(f"[!] 422 Unprocessable Entity: {msg}")
             return
-        print(f"[i] Repo already exists, using existing one.")
+        else:
+            print(f"[!] API error {e.status}: {e.body}")
+            return
 
-    # git init in current directory
-    here = Path.cwd()
+    _push_local(Path.cwd(), username, repo_name)
+
+
+def _get_git_identity():
+    """Prompt for git identity if not set, save globally."""
+    git = shutil.which("git") or "git"
+
+    name_result = subprocess.run([git, "config", "--global", "user.name"], capture_output=True, text=True)
+    email_result = subprocess.run([git, "config", "--global", "user.email"], capture_output=True, text=True)
+
+    if name_result.stdout.strip() and email_result.stdout.strip():
+        return
+
+    print()
+    print("[!] Git identity not configured.")
+    name = input("  git user.name: ").strip()
+    email = input("  git user.email: ").strip()
+    if not name or not email:
+        print("[!] Both name and email are required to commit.")
+        return
+
+    subprocess.run([git, "config", "--global", "user.name", name], check=True)
+    subprocess.run([git, "config", "--global", "user.email", email], check=True)
+    print(f"[+] Git identity saved: {name} <{email}>")
+
+
+def _push_local(here: Path, username: str, repo_name: str):
+    """Git init + remote + add + commit + push from an existing directory."""
     print(f"[+] Git init in {here}")
-    subprocess.run(["git", "init"], cwd=here, check=True, capture_output=True)
-    subprocess.run(
-        ["git", "remote", "add", "origin",
-         f"https://github.com/{username}/{repo_name}.git"],
-        cwd=here, check=True, capture_output=True
-    )
 
-    # First commit if needed
+    is_new_init = not (here / ".git").exists()
+    if is_new_init:
+        subprocess.run(["git", "init"], cwd=here, check=True, capture_output=True)
+
+    remote_url = f"https://github.com/{username}/{repo_name}.git"
+    check_remote = subprocess.run(
+        ["git", "-C", str(here), "remote", "get-url", "origin"],
+        capture_output=True, text=True
+    )
+    if check_remote.returncode == 0:
+        if check_remote.stdout.strip() != remote_url:
+            subprocess.run(
+                ["git", "-C", str(here), "remote", "set-url", "origin", remote_url],
+                check=True, capture_output=True
+            )
+            print(f"[i] Updated origin URL to {remote_url}")
+        else:
+            print("[i] Remote origin already set.")
+    else:
+        subprocess.run(
+            ["git", "-C", str(here), "remote", "add", "origin", remote_url],
+            cwd=here, check=True, capture_output=True
+        )
+
     result = subprocess.run(
         ["git", "-C", str(here), "status", "--porcelain"],
         capture_output=True, text=True
     ).stdout.strip()
     if result:
         subprocess.run(["git", "-C", str(here), "add", "."], check=True)
-        subprocess.run(
+        commit_result = subprocess.run(
             ["git", "-C", str(here), "commit", "-m", "Initial commit"],
-            check=True, capture_output=True
+            capture_output=True, text=True
         )
-        print("[+] First commit created.")
+        if commit_result.returncode == 0:
+            print("[+] First commit created.")
+        elif "Author identity unknown" in commit_result.stderr:
+            _get_git_identity()
+            commit_result = subprocess.run(
+                ["git", "-C", str(here), "commit", "-m", "Initial commit"],
+                capture_output=True, text=True
+            )
+            if commit_result.returncode == 0:
+                print("[+] First commit created.")
+            else:
+                print(f"[!] Commit failed:\n{commit_result.stderr}")
+                return
+        else:
+            print(f"[!] Commit failed:\n{commit_result.stderr}")
+            return
     else:
         print("[i] No files to commit.")
 
-    # Push
-    push = subprocess.run(
-        ["git", "-C", str(here), "push", "-u", "origin", "HEAD"],
-        capture_output=True, text=True
-    )
-    print(push.stdout or "[+] Pushed to origin.")
-    if push.returncode != 0:
-        print(f"[!] Push failed: {push.stderr}")
+    push = subprocess.run(["git", "-C", str(here), "push", "-u", "origin", "HEAD"])
+    if push.returncode == 0:
+        print("[+] Pushed to origin.")
+        print(f"  -> https://github.com/{username}/{repo_name}")
+    else:
+        print("[!] Push failed.")
 
 
 # ── Interactive Menu ─────────────────────────────────────────
 
-def show_menu(choices: list[tuple[str, str]], header: str) -> int:
+def show_menu(choices: list[tuple[str, str, str]], header: str) -> int:
     print()
     print(header)
-    print("-" * 40)
-    for i, (label, _) in enumerate(choices, 1):
+    print("-" * 50)
+    for i, (label, _, desc) in enumerate(choices, 1):
         print(f"  {i}. {label}")
+        print(f"     {desc}")
     print(f"  0. Exit")
     print()
     while True:
@@ -230,17 +383,17 @@ def interactive():
 
     if repo:
         choice = show_menu([
-            ("Push (commit + push)", "push"),
-            ("Pull", "pull"),
-            ("Status", "status"),
-            ("New GitHub repo (no clone)", "new"),
-            ("Init here (create repo + push)", "init"),
+            ("Push (commit + push)", "push", "Stage all + commit with a message + push to remote"),
+            ("Pull", "pull", "Fetch and merge latest changes from remote"),
+            ("Status", "status", "Show uncommitted changes and remote state"),
+            ("New GitHub repo", "new", "Create a remote repo on GitHub (does not push local files)"),
+            ("New here", "init", "Create a remote repo + init + push all local files in one step"),
         ], f"[{repo.name}] What to do?")
         action = ["push", "pull", "status", "new", "init"][choice - 1]
     else:
         choice = show_menu([
-            ("New GitHub repo (no clone)", "new"),
-            ("Init here (create repo + push)", "init"),
+            ("New GitHub repo", "new", "Create a remote repo on GitHub (does not push local files)"),
+            ("New here", "init", "Create a remote repo + init + push all local files in one step"),
         ], "[Not a git repo] What to do?")
         action = ["new", "init"][choice - 1]
 
@@ -259,7 +412,8 @@ def interactive():
             return
         priv = input("Private? [Y/n]: ").strip().lower() != "n"
         if action == "new":
-            cmd_new(name, priv)
+            push_local = input("Push local files? [y/N]: ").strip().lower() == "y"
+            cmd_new(name, priv, push_local)
         else:
             cmd_init(name, priv)
 
@@ -274,6 +428,10 @@ def main():
                         help="make repo private (default: True)")
     parser.add_argument("--public", dest="private", action="store_false",
                         help="make repo public")
+    parser.add_argument("--push-local", dest="push_local", action="store_true", default=False,
+                        help="new: also git init + push local files to the new repo")
+    parser.add_argument("--no-push", dest="push_local", action="store_false",
+                        help="init: skip git init + push (create remote repo only)")
     args = parser.parse_args()
 
     if not args.command:
@@ -306,15 +464,15 @@ def main():
 
     elif cmd == "new":
         if not args.arg:
-            print("[!] Usage: gh new <repo-name>")
+            print("[!] Usage: gh new <repo-name> [--push-local]")
             sys.exit(1)
-        cmd_new(args.arg, args.private)
+        cmd_new(args.arg, args.private, args.push_local)
 
     elif cmd == "init":
         if not args.arg:
-            print("[!] Usage: gh init <repo-name>")
+            print("[!] Usage: gh init <repo-name> [--no-push]")
             sys.exit(1)
-        cmd_init(args.arg, args.private)
+        cmd_init(args.arg, args.private, args.push_local)
 
     else:
         print(f"[!] Unknown command: {cmd}")

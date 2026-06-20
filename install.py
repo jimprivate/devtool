@@ -1,100 +1,79 @@
 #!/usr/bin/env python3
 r"""
-install: one-time setup for the devtool collection.
-
-Source of truth (high change frequency):
-    https://github.com/jimprivate/devtool/tree/master/apps
-
-This file (low change frequency — lives on GitHub):
-    https://github.com/jimprivate/devtool/blob/master/install.py
+devtool — install / update / uninstall / run tools.
+No params, no launchers, no mess.
 """
 
 import os
 import platform
 import shutil
-import stat
 import subprocess
 import sys
 import urllib.request
 from pathlib import Path
-
-# ============================================================
-# Config — change here if you ever move the repo
-# ============================================================
 
 GITHUB_USER = "jimprivate"
 GITHUB_REPO = "devtool"
 GITHUB_BRANCH = "master"
 APPS_SUBDIR = "apps"
 
-API_LIST = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{APPS_SUBDIR}?ref={GITHUB_BRANCH}"
-RAW_BASE  = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{APPS_SUBDIR}"
+APPS_DIR = Path.home() / "devtool" / APPS_SUBDIR
+DEVTOOL_DIR = APPS_DIR.parent
+REPO_URL = f"https://github.com/{GITHUB_USER}/{GITHUB_REPO}.git"
 
-# ============================================================
-# Paths
-# ============================================================
 
-def install_dir():
-    return Path.home() / "devtool" / APPS_SUBDIR
-
-def bin_dir():
-    return Path.home() / ".local" / "bin"
-
-# ============================================================
-# HTTP — stdlib only
-# ============================================================
+# ── HTTP ─────────────────────────────────────────────────────────────────────
 
 def http_get(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "devtool-install"})
+    req = urllib.request.Request(url, headers={"User-Agent": "devtool"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return r.read()
 
-def http_json(url):
-    import json
-    return json.loads(http_get(url).decode("utf-8"))
 
-# ============================================================
-# Git install — only called when git is missing
-# ============================================================
+# ── Git ───────────────────────────────────────────────────────────────────────
+
+def refresh_path():
+    if platform.system() == "Windows":
+        machine = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "[Environment]::GetEnvironmentVariable('Path','Machine')"],
+            capture_output=True, text=True).stdout.strip()
+        os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + machine
+
+
+def find_git():
+    refresh_path()
+    return shutil.which("git")
+
 
 def install_git():
     sysname = platform.system()
-    print("[+] git not found — installing...")
+    print("[+] git not found. Installing...")
 
     if sysname == "Windows":
-        # Win: try winget first, fallback to direct download
-        import urllib.request as _urllib
         try:
-            import subprocess as _sub
-            r = _sub.run(["winget", "install", "--id", "Git.Git", "-e",
-                          "--source", "winget",
-                          "--accept-package-agreements", "--accept-source-agreements"],
-                         capture_output=True, timeout=120)
+            r = subprocess.run(
+                ["winget", "install", "--id", "Git.Git", "-e",
+                 "--source", "winget",
+                 "--accept-package-agreements", "--accept-source-agreements"],
+                capture_output=True, timeout=180)
             if r.returncode == 0:
-                # Refresh PATH from registry
-                user_path  = os.environ.get("PATH", "")
-                machine_path = _sub.run(
-                    ["powershell", "-NoProfile", "-Command",
-                     "[Environment]::GetEnvironmentVariable('Path','Machine')"],
-                    capture_output=True, text=True).stdout.strip()
-                os.environ["PATH"] = user_path + os.pathsep + machine_path
-                if shutil.which("git"):
+                refresh_path()
+                if find_git():
                     print("    git installed via winget.")
-                    return True
+                    return
         except Exception as e:
             print(f"    winget failed: {e}")
 
-        # Fallback: direct portable git zip
         url = "https://github.com/git-for-windows/git/releases/download/v2.47.0.windows.1/MinGit-64bit.zip"
         tmp = Path(os.environ.get("TEMP", "/tmp")) / "mingit.zip"
         dest = Path.home() / ".local" / "git"
         print(f"    downloading portable git to {dest}...")
-        _urllib.request.urlretrieve(url, tmp)
+        urllib.request.urlretrieve(url, tmp)
         import zipfile
         with zipfile.ZipFile(tmp) as z:
             z.extractall(dest.parent)
         tmp.unlink()
-        # Find the extracted folder (MinGit-xxx)
         for sub in dest.parent.iterdir():
             if sub.name.startswith("MinGit"):
                 git_bin = sub / "cmd"
@@ -102,177 +81,304 @@ def install_git():
         else:
             git_bin = dest / "cmd"
         os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + str(git_bin)
-        print(f"    git installed to {dest.parent}.")
-        return True
+        print(f"    git extracted to {dest.parent}.")
 
     elif sysname == "Darwin":
-        # macOS: brew or xcode-select
         if shutil.which("brew"):
             subprocess.run(["brew", "install", "git"], check=True)
         else:
-            print("    Homebrew not found. Run:  xcode-select --install")
+            print("    Run:  xcode-select --install")
             sys.exit(1)
-        return True
 
     else:
-        # Linux: detect package manager
-        for cmd in [
+        for cmd_pair in [
             (["apt-get", "update"], ["apt-get", "install", "-y", "git"]),
             (["dnf", "install", "-y", "git"], None),
             (["pacman", "-S", "--noconfirm", "git"], None),
             (["apk", "add", "git"], None),
         ]:
-            installer = cmd[1] or cmd[0]
+            setup, install = cmd_pair
+            inst_cmd = install or setup
             try:
-                if cmd[0][0] == "apt-get":
-                    subprocess.run(cmd[0], check=True, capture_output=True)
-                subprocess.run(installer, check=True, capture_output=True)
-                print(f"    git installed via {' '.join(installer)}.")
-                return True
+                if setup[0] == "apt-get":
+                    subprocess.run(setup, check=True, capture_output=True)
+                subprocess.run(inst_cmd, check=True, capture_output=True)
+                print(f"    git installed via {' '.join(inst_cmd)}.")
+                return
             except Exception:
                 pass
-        print("[!] Could not auto-install git. Install manually via your package manager.")
+        print("[!] Could not auto-install git. Install manually.")
         sys.exit(1)
 
-# ============================================================
-# Git — ensure available, install if missing
-# ============================================================
 
-def refresh_path():
-    if platform.system() != "Windows":
-        return
-    import subprocess as _sub
-    machine_path = _sub.run(
-        ["powershell", "-NoProfile", "-Command",
-         "[Environment]::GetEnvironmentVariable('Path','Machine')"],
-        capture_output=True, text=True).stdout.strip()
-    user_path = os.environ.get("PATH", "")
-    os.environ["PATH"] = user_path + os.pathsep + machine_path
+# ── Path ─────────────────────────────────────────────────────────────────────
 
-def ensure_git():
-    refresh_path()
-    if shutil.which("git"):
-        return True
-    install_git()
-    refresh_path()
-    if not shutil.which("git"):
-        print("[!] git still not found after install. Please re-run install in a new shell.")
-        sys.exit(1)
-
-# ============================================================
-# Pull tools via git clone
-# ============================================================
-
-def pull_tools():
-    inst = install_dir()
-    repo_url = f"https://github.com/{GITHUB_USER}/{GITHUB_REPO}.git"
-    tools_instatl = inst.parent / ".git"
-
-    if tools_instatl.exists():
-        inst.mkdir(parents=True, exist_ok=True)
-        print(f"[+] {inst} already has a repo — pulling latest.")
-        subprocess.run(["git", "-C", str(inst.parent), "pull", "--ff-only"],
-                       check=True, capture_output=True)
-    else:
-        print(f"[+] Cloning {repo_url}")
-        subprocess.run(["git", "clone", "--branch", GITHUB_BRANCH,
-                        "--depth", "1", repo_url, str(inst.parent)],
-                       check=True, capture_output=True)
-
-    # List what we got
-    py_files = sorted(inst.glob("*.py"))
-    for pf in py_files:
-        print(f"    + {pf.name}")
-
-# ============================================================
-# Launchers — one per .py, on PATH
-# ============================================================
-
-def launcher_name(name):
-    return name[:-3] if name.endswith(".py") else name
-
-def make_launcher(py_path, bin_path):
-    name = launcher_name(py_path.name)
-    if platform.system() == "Windows":
-        shim = bin_path / f"{name}.cmd"
-        shim.write_text(
-            f"@echo off\r\npython \"{py_path}\" %*\r\n",
-            encoding="ascii",
-        )
-    else:
-        shim = bin_path / name
-        shim.write_text(
-            f"#!/usr/bin/env bash\nexec python3 \"{py_path}\" \"$@\"\n",
-            encoding="utf-8",
-        )
-        shim.chmod(shim.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-    return name
-
-def install_launchers():
-    inst = install_dir()
-    py_files = sorted(inst.glob("*.py"))
-    bd = bin_dir()
-    bd.mkdir(parents=True, exist_ok=True)
-    print(f"[+] Launchers -> {bd}")
-    names = []
-    for pf in py_files:
-        n = make_launcher(pf, bd)
-        print(f"    + {n}")
-        names.append(n)
-    return names
-
-# ============================================================
-# PATH warning
-# ============================================================
-
-def set_path():
-    bd = bin_dir()
-    cur = os.environ.get("PATH", "")
+def path_line():
+    apps = str(APPS_DIR)
     sep = ";" if platform.system() == "Windows" else ":"
-    if str(bd) in cur.split(sep):
+    return f'export PATH="$PATH:{apps}"\n'
+
+
+def in_path():
+    sep = ";" if platform.system() == "Windows" else ":"
+    return str(APPS_DIR) in os.environ.get("PATH", "").split(sep)
+
+
+def add_to_path():
+    if in_path():
+        print("    Already in PATH.")
         return
-    print()
-    print(f"[+] Adding {bd} to PATH...")
+
     if platform.system() == "Windows":
-        import subprocess as _sub
-        user_path = _sub.run(
+        machine = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
-             "[Environment]::GetEnvironmentVariable('Path','User')"],
+             "[Environment]::GetEnvironmentVariable('Path','Machine')"],
             capture_output=True, text=True).stdout.strip()
-        new_path = user_path + ";" + str(bd) if user_path else str(bd)
-        _sub.run(
+        new_path = machine + ";" + str(APPS_DIR) if machine else str(APPS_DIR)
+        subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              f"[Environment]::SetEnvironmentVariable('Path', '{new_path}', 'User')"],
             check=True, capture_output=True)
-        os.environ["PATH"] = cur + sep + str(bd)
-        print(f"    Done. Restart your terminal to use the tools.")
+        os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + str(APPS_DIR)
+        print("    Added to system PATH. Restart your terminal to use tools.")
+
     else:
-        rc = Path.home() / (".zshrc" if (Path.home() / ".zshrc").exists() else ".bashrc")
-        line = f'\nexport PATH="$PATH:{bd}"\n'
+        rc = Path.home() / (
+            ".zshrc" if (Path.home() / ".zshrc").exists()
+            else ".bashrc" if (Path.home() / ".bashrc").exists()
+            else ".profile"
+        )
+        line = path_line()
         existing = rc.read_text() if rc.exists() else ""
         if line.strip() not in existing:
             rc.write_text(existing + line)
             print(f"    Added to {rc}. Run:  source {rc}")
         else:
-            print(f"    Already in {rc}.")
+            print("    Already in PATH.")
 
-# ============================================================
-# Main
-# ============================================================
+
+def remove_from_path():
+    if platform.system() == "Windows":
+        machine = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "[Environment]::GetEnvironmentVariable('Path','Machine')"],
+            capture_output=True, text=True).stdout.strip()
+        sep = ";"
+        parts = [p for p in machine.split(sep) if p != str(APPS_DIR)]
+        new_path = sep.join(parts)
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"[Environment]::SetEnvironmentVariable('Path', '{new_path}', 'User')"],
+            check=True, capture_output=True)
+    else:
+        rc = Path.home() / (
+            ".zshrc" if (Path.home() / ".zshrc").exists()
+            else ".bashrc" if (Path.home() / ".bashrc").exists()
+            else ".profile"
+        )
+        if not rc.exists():
+            return
+        line = path_line().strip()
+        lines = [l for l in rc.read_text().splitlines() if l.strip() != line]
+        rc.write_text("\n".join(lines) + "\n")
+
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+def cmd_install():
+    print()
+    print("[ Install ]")
+    if not find_git():
+        install_git()
+        refresh_path()
+
+    if DEVTOOL_DIR.exists() and (DEVTOOL_DIR / ".git").exists():
+        print(f"[+] ~/devtool already exists — pulling latest...")
+        subprocess.run(["git", "-C", str(DEVTOOL_DIR), "pull", "--ff-only"],
+                      check=True, capture_output=True)
+    else:
+        print(f"[+] Cloning {REPO_URL}")
+        DEVTOOL_DIR.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "clone", "--branch", GITHUB_BRANCH,
+             "--depth", "1", REPO_URL, str(DEVTOOL_DIR)],
+            check=True, capture_output=True)
+
+    for pf in sorted(APPS_DIR.glob("*.py")):
+        print(f"    + {pf.name}")
+
+    add_to_path()
+    print("[+] Install complete.")
+
+
+def cmd_update():
+    print()
+    print("[ Update ]")
+    if not DEVTOOL_DIR.exists():
+        print("[!] Not installed. Run Install first.")
+        return
+    if not find_git():
+        print("[!] git not found.")
+        return
+    print(f"[+] Pulling into ~/devtool...")
+    subprocess.run(["git", "-C", str(DEVTOOL_DIR), "pull", "--ff-only"],
+                   check=True, capture_output=True)
+    for pf in sorted(APPS_DIR.glob("*.py")):
+        print(f"    ~ {pf.name}")
+    print("[+] Update complete.")
+
+
+def cmd_uninstall():
+    print()
+    print("[ Uninstall ]")
+    print("    This removes ~/devtool and removes PATH entry.")
+    print("    Your code is safe — ~/devtool will be deleted.")
+    confirm = input("    Type 'yes' to confirm: ").strip()
+    if confirm != "yes":
+        print("    Cancelled.")
+        return
+
+    remove_from_path()
+    shutil.rmtree(DEVTOOL_DIR)
+    print("[+] ~/devtool removed.")
+    print("    Restart your terminal. Tools are gone.")
+
+
+def _tool_description(tool_path: Path) -> str:
+    """Extract first line of docstring as short description."""
+    try:
+        text = tool_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+    # Find first triple-quoted docstring
+    start = text.find('"""')
+    if start == -1:
+        start = text.find("'''")
+        if start == -1:
+            return ""
+    quote = text[start:start + 3]
+    start += 3
+    end = text.find(quote, start)
+    if end == -1:
+        return ""
+    # Grab first non-empty line from inside the docstring
+    for line in text[start:end].strip().splitlines():
+        line = line.strip()
+        if line:
+            # Strip leading comment characters used in shebang-style docs
+            return line.lstrip("#").strip()
+    return ""
+
+
+def cmd_list():
+    print()
+    print("[ Tools ]")
+    if APPS_DIR.exists():
+        tools = sorted(APPS_DIR.glob("*.py"))
+    else:
+        tools = []
+    if tools:
+        for t in tools:
+            desc = _tool_description(t)
+            print(f"    {t.stem}   {desc}")
+    else:
+        print("    No tools found. Run Install first.")
+
+
+def cmd_run():
+    if not APPS_DIR.exists():
+        print("[!] Not installed. Run Install first.")
+        return
+
+    tools = sorted(APPS_DIR.glob("*.py"))
+    if not tools:
+        print("[!] No tools found.")
+        return
+
+    print()
+    print("[ Run ]")
+    print("-" * 40)
+    for i, t in enumerate(tools, 1):
+        print(f"  {i}. {t.stem}")
+    print("  0. Back")
+    print()
+
+    while True:
+        val = input("Select: ").strip()
+        if val == "0":
+            return
+        try:
+            n = int(val)
+            if 1 <= n <= len(tools):
+                break
+        except ValueError:
+            pass
+        print("Invalid.")
+
+    tool = tools[n - 1]
+    py = "py" if platform.system() == "Windows" else "python3"
+    print()
+    subprocess.run([py, str(tool)])
+
+
+# ── Menu ──────────────────────────────────────────────────────────────────────
+
+MENU_INSTALL   = ("Install / Update",    "install")
+MENU_UPDATE    = ("Check for Updates",   "update")
+MENU_UNINSTALL = ("Uninstall",           "uninstall")
+MENU_LIST      = ("List Tools",          "list")
+MENU_RUN       = ("Run a Tool",          "run")
+
+
+def show_menu(header):
+    options = [MENU_INSTALL, MENU_UPDATE, MENU_LIST, MENU_RUN, MENU_UNINSTALL]
+    print()
+    print(header)
+    print("-" * 40)
+    for i, (label, _) in enumerate(options, 1):
+        print(f"  {i}. {label}")
+    print("  0. Exit")
+    print()
+    while True:
+        val = input("Select: ").strip()
+        if val == "0":
+            sys.exit(0)
+        try:
+            n = int(val)
+            if 1 <= n <= len(options):
+                return options[n - 1][1]
+        except ValueError:
+            pass
+        print("Invalid.")
+
 
 def main():
-    print(f"[install] python {sys.version.split()[0]} on {platform.system()}")
+    is_installed = DEVTOOL_DIR.exists() and (DEVTOOL_DIR / ".git").exists()
 
-    ensure_git()
-    pull_tools()
-    names = install_launchers()
-    set_path()
+    if is_installed:
+        branch = subprocess.run(
+            ["git", "-C", str(DEVTOOL_DIR), "branch", "--show-current"],
+            capture_output=True, text=True).stdout.strip() or GITHUB_BRANCH
+        header = f"[ devtool | {branch} ]"
+    else:
+        header = "[ devtool | not installed ]"
 
-    print("[install] Done. Open a new terminal and run:")
-    for n in names:
-        print(f"    {n}")
-    print()
-    print("To update: cd ~/devtool && git pull")
+    action = show_menu(header)
+
+    if action == "install":
+        cmd_install()
+    elif action == "update":
+        cmd_update()
+    elif action == "uninstall":
+        cmd_uninstall()
+    elif action == "list":
+        cmd_list()
+    elif action == "run":
+        cmd_run()
+
+    input("\nPress Enter to continue...")
+    main()
+
 
 if __name__ == "__main__":
     main()
