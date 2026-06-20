@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# deploy-linux.sh — Linux bootstrap trigger for w11-tools
-# Responsibility: find Python, hand off to bootstrap.py on GitHub.
+# deploy-linux.sh — Linux bootstrap trigger for devtool
+# Responsibility: find Python, hand off to install.py on GitHub.
 # Change frequency: NEVER (static, lives on your own server)
-# bootstrap logic lives at: github.com/jimprivate/tools/main/bootstrap.py
+# install logic lives at: github.com/jimprivate/devtool/master/install.py
 
 set -e
 
@@ -11,7 +11,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 NC='\033[0m'
 
-echo -e "${CYAN}[w11-tools] Linux${NC}"
+echo -e "${CYAN}[devtool] Linux${NC}"
 
 # Find Python
 PY=""
@@ -28,11 +28,11 @@ fi
 echo -e "${GREEN}[+]${NC} Python: $(command -v "$PY")"
 
 # Download and run bootstrap from GitHub
-URL="https://raw.githubusercontent.com/jimprivate/devtool/main/bootstrap.py"
-TMP="/tmp/w11-bootstrap.py"
+URL="https://raw.githubusercontent.com/jimprivate/devtool/master/install.py"
+TMP="/tmp/devtool-install.py"
 echo "[+] Fetching bootstrap from GitHub..."
 curl -fsSL "$URL" -o "$TMP"
 "$PY" "$TMP"
 rm -f "$TMP"
 
-echo -e "${CYAN}[w11-tools] Done.${NC}"
+echo -e "${CYAN}[devtool] Done.${NC}"

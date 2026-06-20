@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 r"""
-bootstrap: one-time setup for the w11 tools collection.
+install: one-time setup for the devtool collection.
 
 Source of truth (high change frequency):
-    https://github.com/jimprivate/tools/tree/main/tools
+    https://github.com/jimprivate/devtool/tree/master/apps
 
 This file (low change frequency — lives on GitHub):
-    https://github.com/jimprivate/tools/blob/main/bootstrap.py
+    https://github.com/jimprivate/devtool/blob/master/install.py
 """
 
 import os
@@ -25,17 +25,17 @@ from pathlib import Path
 GITHUB_USER = "jimprivate"
 GITHUB_REPO = "devtool"
 GITHUB_BRANCH = "master"
-TOOLS_SUBDIR = "tools"
+APPS_SUBDIR = "apps"
 
-API_LIST = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{TOOLS_SUBDIR}?ref={GITHUB_BRANCH}"
-RAW_BASE  = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{TOOLS_SUBDIR}"
+API_LIST = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{APPS_SUBDIR}?ref={GITHUB_BRANCH}"
+RAW_BASE  = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GITHUB_BRANCH}/{APPS_SUBDIR}"
 
 # ============================================================
 # Paths
 # ============================================================
 
 def install_dir():
-    return Path.home() / "w11-tools" / "tools"
+    return Path.home() / "devtool" / "tools"
 
 def bin_dir():
     return Path.home() / ".local" / "bin"
@@ -45,7 +45,7 @@ def bin_dir():
 # ============================================================
 
 def http_get(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "w11-bootstrap"})
+    req = urllib.request.Request(url, headers={"User-Agent": "devtool-install"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return r.read()
 
@@ -156,7 +156,7 @@ def ensure_git():
     install_git()
     refresh_path()
     if not shutil.which("git"):
-        print("[!] git still not found after install. Please re-run bootstrap in a new shell.")
+        print("[!] git still not found after install. Please re-run install in a new shell.")
         sys.exit(1)
 
 # ============================================================
@@ -261,18 +261,18 @@ def set_path():
 # ============================================================
 
 def main():
-    print(f"[bootstrap] python {sys.version.split()[0]} on {platform.system()}")
+    print(f"[install] python {sys.version.split()[0]} on {platform.system()}")
 
     ensure_git()
     pull_tools()
     names = install_launchers()
     set_path()
 
-    print("[bootstrap] Done. Open a new terminal and run:")
+    print("[install] Done. Open a new terminal and run:")
     for n in names:
         print(f"    {n}")
     print()
-    print("To update: cd ~/w11-tools && git pull")
+    print("To update: cd ~/devtool && git pull")
 
 if __name__ == "__main__":
     main()

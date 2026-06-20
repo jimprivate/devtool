@@ -1,11 +1,11 @@
-# deploy-win.ps1 — Windows bootstrap trigger for w11-tools
-# Responsibility: find Python, hand off to bootstrap.py on GitHub.
+# deploy-win.ps1 — Windows bootstrap trigger for devtool
+# Responsibility: find Python, hand off to install.py on GitHub.
 # Change frequency: NEVER (static, lives on your own server)
-# bootstrap logic lives at: github.com/jimprivate/devtool/master/bootstrap.py
+# install logic lives at: github.com/jimprivate/devtool/master/install.py
 
 $ErrorActionPreference = "Stop"
 
-Write-Host "[w11-tools] Windows" -ForegroundColor Cyan
+Write-Host "[devtool] Windows" -ForegroundColor Cyan
 
 # Find Python — try common names in order
 $py = $null
@@ -22,11 +22,11 @@ if (-not $py) {
 Write-Host "[+] Python: $((Get-Command $py).Source)"
 
 # Download and run bootstrap from GitHub
-$url = "https://raw.githubusercontent.com/jimprivate/devtool/master/bootstrap.py"
-$tmp = "$env:TEMP\w11-bootstrap.py"
-Write-Host "[+] Fetching bootstrap from GitHub..."
+$url = "https://raw.githubusercontent.com/jimprivate/devtool/master/install.py"
+$tmp = "$env:TEMP\devtool-install.py"
+Write-Host "[+] Fetching install.py from GitHub..."
 Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
 & $py $tmp
 Remove-Item $tmp -ErrorAction SilentlyContinue
 
-Write-Host "[w11-tools] Done." -ForegroundColor Cyan
+Write-Host "[devtool] Done." -ForegroundColor Cyan
