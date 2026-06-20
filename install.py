@@ -35,7 +35,7 @@ RAW_BASE  = f"https://raw.githubusercontent.com/{GITHUB_USER}/{GITHUB_REPO}/{GIT
 # ============================================================
 
 def install_dir():
-    return Path.home() / "devtool" / "tools"
+    return Path.home() / "devtool" / APPS_SUBDIR
 
 def bin_dir():
     return Path.home() / ".local" / "bin"
