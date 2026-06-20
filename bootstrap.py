@@ -138,10 +138,23 @@ def install_git():
 # Git — ensure available, install if missing
 # ============================================================
 
+def refresh_path():
+    if platform.system() != "Windows":
+        return
+    import subprocess as _sub
+    machine_path = _sub.run(
+        ["powershell", "-NoProfile", "-Command",
+         "[Environment]::GetEnvironmentVariable('Path','Machine')"],
+        capture_output=True, text=True).stdout.strip()
+    user_path = os.environ.get("PATH", "")
+    os.environ["PATH"] = user_path + os.pathsep + machine_path
+
 def ensure_git():
+    refresh_path()
     if shutil.which("git"):
         return True
     install_git()
+    refresh_path()
     if not shutil.which("git"):
         print("[!] git still not found after install. Please re-run bootstrap in a new shell.")
         sys.exit(1)
