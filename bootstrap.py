@@ -24,7 +24,7 @@ from pathlib import Path
 
 GITHUB_USER = "jimprivate"
 GITHUB_REPO = "devtool"
-GITHUB_BRANCH = "main"
+GITHUB_BRANCH = "master"
 TOOLS_SUBDIR = "tools"
 
 API_LIST = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/contents/{TOOLS_SUBDIR}?ref={GITHUB_BRANCH}"
