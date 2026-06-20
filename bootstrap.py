@@ -152,12 +152,11 @@ def ensure_git():
 
 def pull_tools():
     inst = install_dir()
-    inst.mkdir(parents=True, exist_ok=True)
-
     repo_url = f"https://github.com/{GITHUB_USER}/{GITHUB_REPO}.git"
     tools_instatl = inst.parent / ".git"
 
     if tools_instatl.exists():
+        inst.mkdir(parents=True, exist_ok=True)
         print(f"[+] {inst} already has a repo — pulling latest.")
         subprocess.run(["git", "-C", str(inst.parent), "pull", "--ff-only"],
                        check=True, capture_output=True)
