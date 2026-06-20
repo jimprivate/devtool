@@ -1,7 +1,7 @@
 # deploy-win.ps1 — Windows bootstrap trigger for w11-tools
 # Responsibility: find Python, hand off to bootstrap.py on GitHub.
 # Change frequency: NEVER (static, lives on your own server)
-# bootstrap logic lives at: github.com/jimprivate/tools/main/bootstrap.py
+# bootstrap logic lives at: github.com/jimprivate/devtool/master/bootstrap.py
 
 $ErrorActionPreference = "Stop"
 
@@ -22,7 +22,7 @@ if (-not $py) {
 Write-Host "[+] Python: $((Get-Command $py).Source)"
 
 # Download and run bootstrap from GitHub
-$url = "https://raw.githubusercontent.com/jimprivate/devtool/main/bootstrap.py"
+$url = "https://raw.githubusercontent.com/jimprivate/devtool/master/bootstrap.py"
 $tmp = "$env:TEMP\w11-bootstrap.py"
 Write-Host "[+] Fetching bootstrap from GitHub..."
 Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
