@@ -12,6 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Literal
 
 GITHUB_API = "https://api.github.com"
 
@@ -361,11 +362,28 @@ def _get_git_identity():
 
 def _push_local(here: Path, username: str, repo_name: str):
     """Git init + remote + add + commit + push from an existing directory."""
+    # On Windows / network drives, git refuses -C into paths it considers
+    # "dubious ownership". Whitelist the directory once, globally.
+    here_str = str(here.resolve()).replace("\\", "/")
+    subprocess.run(
+        ["git", "config", "--global", "--add", "safe.directory", here_str],
+        capture_output=True,
+    )
+
     print(f"[+] Git init in {here}")
 
     is_new_init = not (here / ".git").exists()
     if is_new_init:
         subprocess.run(["git", "init"], cwd=here, check=True, capture_output=True)
+        # Never rewrite line endings — code must stay as-is across OSes.
+        subprocess.run(
+            ["git", "config", "--local", "core.autocrlf", "false"],
+            cwd=here, check=True, capture_output=True,
+        )
+        attrs = here / ".gitattributes"
+        if not attrs.exists():
+            attrs.write_text("* text=auto eol=lf\n", encoding="utf-8")
+            print("[+] Created .gitattributes (force LF for all text files)")
 
     remote_url = f"https://github.com/{username}/{repo_name}.git"
     check_remote = subprocess.run(
@@ -392,7 +410,10 @@ def _push_local(here: Path, username: str, repo_name: str):
         capture_output=True, text=True
     ).stdout.strip()
     if result:
-        subprocess.run(["git", "-C", str(here), "add", "."], check=True)
+        subprocess.run(
+            ["git", "-C", str(here), "add", "."],
+            check=True, capture_output=True,
+        )
         commit_result = subprocess.run(
             ["git", "-C", str(here), "commit", "-m", "Initial commit"],
             capture_output=True, text=True
@@ -416,12 +437,15 @@ def _push_local(here: Path, username: str, repo_name: str):
     else:
         print("[i] No files to commit.")
 
-    push = subprocess.run(["git", "-C", str(here), "push", "-u", "origin", "HEAD"])
+    push = subprocess.run(
+        ["git", "-C", str(here), "push", "-u", "origin", "HEAD"],
+        capture_output=True, text=True,
+    )
     if push.returncode == 0:
         print("[+] Pushed to origin.")
         print(f"  -> https://github.com/{username}/{repo_name}")
     else:
-        print("[!] Push failed.")
+        print(f"[!] Push failed: {push.stderr.strip() or push.stdout.strip()}")
 
 
 # ── Interactive Menu ─────────────────────────────────────────
@@ -492,25 +516,26 @@ def _find_all_repos() -> list[tuple[Path, str, str]]:
     return found
 
 
-def _pick_repo() -> Path | None:
-    """Interactive repo picker. Returns chosen Path or None."""
+def _pick_repo() -> Path | Literal["__init__"] | None:
+    """Interactive repo picker. Returns chosen Path, '__init__', or None."""
     repos = _find_all_repos()
-    if not repos:
-        return None
-
     print()
     print("[ Pick a repo ]")
     print("-" * 50)
     for i, (rp, name, url) in enumerate(repos, 1):
         print(f"  {i}. {name}")
         print(f"     {url}")
+    print(f"  I. Init here")
+    print(f"     Create a new remote repo + git init + push local files")
     print(f"  0. Exit")
     print()
 
     while True:
-        val = input("Select: ").strip()
+        val = input("Select: ").strip().lower()
         if val == "0":
             sys.exit(0)
+        if val == "i":
+            return "__init__"
         try:
             n = int(val)
             if 1 <= n <= len(repos):
@@ -560,6 +585,8 @@ def interactive():
         picked = _pick_repo()
         if picked is None:
             return None
+        if picked == "__init__":
+            return picked
         result2 = _confirm_repo(picked)
         if result2 is True:
             return picked
@@ -576,10 +603,25 @@ def interactive():
         if repo is None:
             print("[!] No git repos found under ~/devtool")
             return
-        repo = _resolve_and_confirm(repo)
-        if repo is None:
-            print("Aborted.")
+        # If user picked init directly, skip confirm and go straight to action
+        if repo == "__init__":
+            # handle inline below after menu
+            pass
+        else:
+            repo = _resolve_and_confirm(repo)
+            if repo is None:
+                print("Aborted.")
+                return
+
+    # Handle direct init picks from non-repo directories
+    if repo == "__init__":
+        name = input("Repo name: ").strip()
+        if not name:
+            print("[!] Repo name required.")
             return
+        priv = input("Private? [Y/n]: ").strip().lower() != "n"
+        cmd_init(name, priv)
+        return
 
     info = _repo_info(repo)
     header = f"[ {repo.name} ]  {info}\n[ What to do? ]"
