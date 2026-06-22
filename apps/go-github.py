@@ -77,19 +77,26 @@ def http_get(url, token, params=None):
         raise HttpError(e.code, body_text) from e
 
 
-class HttpError(Exception):
-    def __init__(self, status: int, body: str):
-        self.status = status
-        self.body = body
-        super().__init__(f"HTTP {status}: {body}")
-
-
 def http_post(url, token, data):
     body = json.dumps(data).encode()
     req = urllib.request.Request(url, data=body, method="POST", headers={
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github+json",
         "Content-Type": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        body_text = e.read().decode(errors="replace")
+        raise HttpError(e.code, body_text) from e
+
+
+def http_delete(url, token):
+    req = urllib.request.Request(url, method="DELETE", headers={
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     })
     try:
@@ -107,6 +114,24 @@ def find_repo_root(start: Path) -> Path | None:
             return p
         p = p.parent
     return None
+
+
+# ── Output helpers ──────────────────────────────────────────
+
+def info(msg: str) -> None:
+    print(f"  {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"  [!] {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"  [+] {msg}")
+
+
+def err(msg: str) -> None:
+    print(f"  [!!] {msg}")
 
 
 # ── Commands ────────────────────────────────────────────────
@@ -480,6 +505,52 @@ def _list_user_repos(token: str, username: str) -> list[tuple[str, str]]:
         return [(it["name"], it["html_url"]) for it in items if isinstance(it, dict) and "name" in it]
     except (HttpError, json.JSONDecodeError, urllib.error.URLError):
         return []
+
+
+def _list_github_repos(token: str, affiliation: str = "owner,collaborator,organization_member",
+                       visibility: str = "all", sort: str = "pushed", direction: str = "desc",
+                       per_page: int = 100) -> list[dict]:
+    """Fetch every repo the token can see, paginating until exhausted.
+    affiliation: owner | collaborator | organization_member (comma-separated).
+    Returns raw repo dicts from the API."""
+    out: list[dict] = []
+    page = 1
+    while True:
+        try:
+            data = http_get(
+                f"{GITHUB_API}/user/repos",
+                token,
+                params={
+                    "affiliation": affiliation,
+                    "visibility": visibility,
+                    "sort": sort,
+                    "direction": direction,
+                    "per_page": per_page,
+                    "page": page,
+                },
+            )
+            batch = json.loads(data)
+        except (HttpError, json.JSONDecodeError, urllib.error.URLError):
+            return out
+        if not isinstance(batch, list) or not batch:
+            return out
+        out.extend(batch)
+        if len(batch) < per_page:
+            return out
+        page += 1
+        if page > 20:  # hard cap: 20 pages × 100 = 2000 repos, enough for most humans
+            return out
+
+
+def _repo_row(r: dict, me: str) -> tuple[str, str, str, str]:
+    """Flatten a GitHub repo dict to (full_name, html_url, visibility_badge, role_badge).
+    me is the authenticated login — used to mark 'mine' vs collaborator."""
+    full = r.get("full_name") or f"{r.get('owner', {}).get('login', '?')}/{r.get('name', '?')}"
+    url = r.get("html_url", "")
+    vis = "priv" if r.get("private") else "pub"
+    owner_login = r.get("owner", {}).get("login", "")
+    role = "owner" if owner_login == me else ("org" if r.get("owner", {}).get("type") == "Organization" else "collab")
+    return full, url, vis, role
 
 
 def _push_only(repo: Path) -> None:
@@ -960,6 +1031,82 @@ def _pick_repo() -> Path | Literal["__init__"] | None:
         print("Invalid, try again.")
 
 
+def _pick_github_repo(visibility: str = "private",
+                      affiliation: str = "owner,collaborator,organization_member",
+                      allow_delete: bool = True) -> str | None:
+    """Picker that shows the user's GitHub repos (paginated). Returns 'owner/name' or None.
+    Pass allow_delete=False to hide the 'D' delete option."""
+    token = get_token()
+    me_data = http_get(f"{GITHUB_API}/user", token)
+    me = json.loads(me_data)["login"]
+
+    repos = _list_github_repos(token, affiliation=affiliation, visibility=visibility)
+    if not repos:
+        print(f"[!] No repos found (visibility={visibility}).")
+        return None
+
+    # Sort: owner first, then by last push (newest first)
+    import datetime as _dt
+    def _key(r):
+        is_owner = r.get("owner", {}).get("login", "") == me
+        pushed = (r.get("pushed_at") or r.get("updated_at") or "")[:19]
+        try:
+            ts = int(_dt.datetime.strptime(pushed, "%Y-%m-%dT%H:%M:%S").timestamp())
+        except ValueError:
+            ts = 0
+        return (0 if is_owner else 1, -ts)
+    repos.sort(key=_key)
+
+    print()
+    print(f"[ Pick a GitHub repo — {len(repos)} visible (visibility={visibility}) ]")
+    print("-" * 90)
+    print(f"  {'#':>4}  {'OWNER/REPO':<46}  {'VIS':<4}  {'ROLE':<5}  PUSHED")
+    print("  " + "-" * 88)
+    for i, r in enumerate(repos, 1):
+        full, _url, vis, role = _repo_row(r, me)
+        pushed = (r.get("pushed_at") or r.get("updated_at") or "")[:10]
+        marker = " *" if role == "owner" else "  "
+        print(f"  {marker}{i:>3}  {full:<46}  {vis:<4}  {role:<5}  {pushed}")
+    if allow_delete:
+        print(f"   D. Delete a repo (you own)")
+    print(f"   0. Exit")
+    print()
+    print("  (* = you are the owner)")
+
+    while True:
+        val = input("Select: ").strip()
+        if val == "0":
+            sys.exit(0)
+        if allow_delete and val.lower() == "d":
+            owner_repos = [r for r in repos if r.get("owner", {}).get("login", "") == me]
+            if not owner_repos:
+                print("[!] You don't own any of the listed repos.")
+                continue
+            print()
+            print("  Repos you own (deletable):")
+            for i, r in enumerate(owner_repos, 1):
+                full, _url, vis, _role = _repo_row(r, me)
+                print(f"    {i}. {full}  [{vis}]")
+            sub = input("  Delete which? (number or owner/name, 0 to cancel): ").strip()
+            if sub == "0" or not sub:
+                continue
+            if sub.isdigit() and 1 <= int(sub) <= len(owner_repos):
+                r = owner_repos[int(sub) - 1]
+                target = r["full_name"]
+            else:
+                target = sub
+            cmd_delete(target)
+            # Refresh list after delete and re-prompt
+            return _pick_github_repo(visibility=visibility, affiliation=affiliation, allow_delete=allow_delete)
+        try:
+            n = int(val)
+            if 1 <= n <= len(repos):
+                return repos[n - 1]["full_name"]
+        except ValueError:
+            pass
+        print("Invalid, try again.")
+
+
 def _confirm_repo(repo: Path) -> bool | Path | None:
     """Ask user to confirm this is the right repo.
     Returns True (confirmed), False (user wants to switch), None (abort)."""
@@ -1081,6 +1228,163 @@ def _get_default_branch(owner: str, name: str, token: str) -> str | None:
         return None
 
 
+def cmd_list(visibility: str = "all", affiliation: str = "owner,collaborator,organization_member"):
+    """List all GitHub repos the token can see, with visibility + role."""
+    token = get_token()
+    me_data = http_get(f"{GITHUB_API}/user", token)
+    me = json.loads(me_data)["login"]
+
+    repos = _list_github_repos(token, affiliation=affiliation, visibility=visibility)
+    if not repos:
+        print("[!] No repos found (or API error).")
+        return
+
+    print(f"[+] {len(repos)} repo(s) visible to {me} (visibility={visibility}):")
+    print("-" * 72)
+    # Header
+    print(f"  {'#':>4}  {'OWNER/REPO':<46}  {'VIS':<4}  {'ROLE':<6}  PUSHED")
+    print("  " + "-" * 70)
+    for i, r in enumerate(repos, 1):
+        full, url, vis, role = _repo_row(r, me)
+        pushed = r.get("pushed_at", "") or r.get("updated_at", "") or ""
+        # Trim ISO timestamp to YYYY-MM-DD
+        if "T" in pushed:
+            pushed = pushed.split("T", 1)[0]
+        print(f"  {i:>4}  {full:<46}  {vis:<4}  {role:<6}  {pushed}")
+    if len(repos) == 100 * 20:
+        print("    (capped at 2000 — refine your filters with --visibility / --affiliation)")
+
+
+def cmd_delete_picker(visibility: str = "all",
+                       affiliation: str = "owner,collaborator,organization_member") -> None:
+    """Pick a repo from a list, then hand off to cmd_delete. Loops so the user can
+    delete several in one session."""
+    token = get_token()
+    me_data = http_get(f"{GITHUB_API}/user", token)
+    me = json.loads(me_data)["login"]
+
+    while True:
+        repos = _list_github_repos(token, affiliation=affiliation, visibility=visibility)
+        if not repos:
+            print(f"[!] No repos found (visibility={visibility}).")
+            return
+
+        # Sort: owner first, then by last push (newest first)
+        import datetime as _dt
+        def _key(r):
+            is_owner = r.get("owner", {}).get("login", "") == me
+            pushed = (r.get("pushed_at") or r.get("updated_at") or "")[:19]
+            try:
+                ts = int(_dt.datetime.strptime(pushed, "%Y-%m-%dT%H:%M:%S").timestamp())
+            except ValueError:
+                ts = 0
+            return (0 if is_owner else 1, -ts)
+        repos.sort(key=_key)
+
+        print()
+        print(f"[ Pick a repo to delete — {len(repos)} visible (visibility={visibility}) ]")
+        print("-" * 90)
+        print(f"  {'#':>4}  {'OWNER/REPO':<46}  {'VIS':<4}  {'ROLE':<5}  PUSHED")
+        print("  " + "-" * 88)
+        for i, r in enumerate(repos, 1):
+            full, _url, vis, role = _repo_row(r, me)
+            pushed = (r.get("pushed_at") or r.get("updated_at") or "")[:10]
+            marker = "*" if role == "owner" else " "
+            print(f"   {marker}{i:>3}  {full:<46}  {vis:<4}  {role:<5}  {pushed}")
+        print()
+        print(f"   F. Filter (change visibility)")
+        print(f"   0. Done")
+        print()
+        print("  (* = you are the owner — only these can be deleted)")
+
+        val = input("Delete which? ").strip()
+        if val in ("0", ""):
+            return
+        if val.lower() == "f":
+            print()
+            print("  [1] all (default)")
+            print("  [2] public only")
+            print("  [3] private only")
+            sub = input("  Visibility [1-3]: ").strip()
+            visibility = {"1": "all", "2": "public", "3": "private"}.get(sub, visibility)
+            continue
+        try:
+            n = int(val)
+            if 1 <= n <= len(repos):
+                target = repos[n - 1]["full_name"]
+            else:
+                print("    Invalid number.")
+                continue
+        except ValueError:
+            # Allow typing owner/name directly
+            target = val
+
+        cmd_delete(target)
+        # cmd_delete already double-confirmed; loop back for next pick.
+
+
+def cmd_delete(target: str) -> None:
+    """Permanently delete a GitHub repo. Two-step y/N confirmation."""
+    token = get_token()
+    me_data = http_get(f"{GITHUB_API}/user", token)
+    me = json.loads(me_data)["login"]
+
+    # Accept "name" or "owner/name"
+    if "/" in target:
+        owner, name = target.split("/", 1)
+    else:
+        owner, name = me, target
+
+    # Verify the repo exists, is owned by the authenticated user, and fetch last commit.
+    try:
+        info = json.loads(http_get(f"{GITHUB_API}/repos/{owner}/{name}", token))
+    except HttpError as e:
+        if e.status == 404:
+            print(f"[!] Repo {owner}/{name} not found (or you lack access).")
+            return
+        print(f"[!] API error {e.status}: {e.body}")
+        return
+
+    actual_owner = info.get("owner", {}).get("login", "")
+    if actual_owner != me:
+        print(f"[!] Refusing: {owner}/{name} is owned by '{actual_owner}', not you ('{me}').")
+        print(f"    Scope: only repos you own can be deleted from this tool.")
+        return
+
+    is_private = info.get("private", False)
+    default_branch = info.get("default_branch", "(unknown)")
+    pushed_at = (info.get("pushed_at") or "").split("T", 1)[0] or "(never)"
+    html_url = info.get("html_url", f"https://github.com/{owner}/{name}")
+
+    print()
+    warn(f"About to PERMANENTLY delete: {owner}/{name}")
+    print(f"    URL       : {html_url}")
+    print(f"    Visibility: {'private' if is_private else 'public'}")
+    print(f"    Default   : {default_branch}")
+    print(f"    Last push : {pushed_at}")
+    warn("    This deletes issues, PRs, releases, wiki, and all history.")
+    warn("    GitHub keeps a tombstones the repo for ~30 days, after which it is unrecoverable.")
+
+    if input("    Continue? [y/N]: ").strip().lower() != "y":
+        print("[i] Aborted.")
+        return
+    if input("    Really delete? [y/N]: ").strip().lower() != "y":
+        print("[i] Aborted.")
+        return
+
+    try:
+        http_delete(f"{GITHUB_API}/repos/{owner}/{name}", token)
+        print(f"[+] Deleted: {owner}/{name}")
+        print(f"    -> {html_url}")
+    except HttpError as e:
+        if e.status == 404:
+            print(f"[!] Repo {owner}/{name} not found (already gone?).")
+        elif e.status == 403:
+            print(f"[!] Forbidden: token lacks delete permission for {owner}/{name}.")
+        else:
+            print(f"[!] Delete failed: HTTP {e.status}: {e.body}")
+
+
 def _parse_owner_repo(remote_url: str) -> tuple[str | None, str | None]:
     """Extract (owner, repo) from a GitHub remote URL.
     Supports https://github.com/owner/repo[.git] and git@github.com:owner/repo[.git]."""
@@ -1095,97 +1399,103 @@ def interactive():
     """Confirm repo -> action menu."""
     repo = find_repo_root(Path.cwd())
 
-    def _resolve_and_confirm(r: Path | None) -> Path | None:
-        if r is None:
-            return None
-        result = _confirm_repo(r)
-        if result is True:
-            return r
-        if result is None:
-            return None
-        # result is False — user wants to switch
-        picked = _pick_repo()
-        if picked is None:
-            return None
-        if picked == "__init__":
-            return picked
-        result2 = _confirm_repo(picked)
-        if result2 is True:
-            return picked
-        return None  # keep rejecting
-
     if repo:
-        repo = _resolve_and_confirm(repo)
+        repo = _resolve_and_confirm_recursive(repo)
         if repo is None:
             print("Aborted.")
             return
     else:
         print("[i] Not in a git repo -- picking one for you...")
-        repo = _pick_repo()
-        if repo is None:
+        picked = _pick_repo()
+        if picked is None:
             print("[!] No git repos found.")
             return
-        # If user picked init directly, skip confirm and go straight to action
-        if repo == "__init__":
-            # handle inline below after menu
-            pass
-        else:
-            repo = _resolve_and_confirm(repo)
-            if repo is None:
-                print("Aborted.")
+        if picked == "__init__":
+            name = input("Repo name: ").strip()
+            if not name:
+                print("[!] Repo name required.")
                 return
-
-    # Handle direct init picks from non-repo directories
-    if repo == "__init__":
-        name = input("Repo name: ").strip()
-        if not name:
-            print("[!] Repo name required.")
+            priv = input("Private? [Y/n]: ").strip().lower() != "n"
+            cmd_init(name, priv)
             return
-        priv = input("Private? [Y/n]: ").strip().lower() != "n"
-        cmd_init(name, priv)
-        return
+        repo = _resolve_and_confirm_recursive(picked)
+        if repo is None:
+            print("Aborted.")
+            return
 
+    _action_menu(repo)
+
+
+def _action_menu(repo: Path):
+    """Show the action menu for a confirmed local repo and dispatch."""
     info = _repo_info(repo)
     header = f"[ {repo.name} ]  {info}\n[ What to do? ]"
     choices = [
         ("Push (commit + push)", "push", "Stage all + commit with a message + push to remote"),
         ("Pull", "pull", "Fetch and merge latest changes from remote"),
         ("Status", "status", "Show uncommitted changes and remote state"),
-        ("Switch repo", "switch", "Pick a different git repo to work with"),
+        ("Switch repo", "switch", "Pick a different git repo to work with (local or GitHub)"),
         ("Wipe remote history", "wipe", "Destructive: replace all GitHub history with a single empty commit"),
+        ("Delete repo", "delete", "Destructive: PERMANENTLY delete the repo from GitHub"),
     ]
     choice = show_menu(choices, header)
-    action = ["push", "pull", "status", "switch", "wipe"][choice - 1]
-
-    if action == "switch":
-        repo = _pick_repo()
-        if repo is None:
-            print("[!] No git repos found.")
-            return
-        repo = _resolve_and_confirm(repo)
-        if repo is None:
-            print("Aborted.")
-            return
-        info = _repo_info(repo)
-        header = f"[ {repo.name} ]  {info}\n[ What to do? ]"
-        choices = [
-            ("Push (commit + push)", "push", "Stage all + commit with a message + push to remote"),
-            ("Pull", "pull", "Fetch and merge latest changes from remote"),
-            ("Status", "status", "Show uncommitted changes and remote state"),
-            ("Switch repo", "switch", "Pick a different git repo to work with"),
-            ("Wipe remote history", "wipe", "Destructive: replace all GitHub history with a single empty commit"),
-        ]
-        choice = show_menu(choices, header)
-        action = ["push", "pull", "status", "switch", "wipe"][choice - 1]
+    action = ["push", "pull", "status", "switch", "wipe", "delete"][choice - 1]
 
     if action == "status":
         cmd_status(repo)
         return
-
     if action == "wipe":
         cmd_wipe_remote(repo)
         return
-
+    if action == "delete":
+        target = _pick_github_repo(visibility="all", allow_delete=False)
+        if target:
+            cmd_delete(target)
+        return
+    if action == "switch":
+        # Ask: scan local siblings, or fetch from GitHub?
+        print()
+        print("  [L] List local repos (scan ~/devtool siblings)")
+        print("  [G] List GitHub repos (your account)")
+        print("  [0] Cancel")
+        sub = input("  Pick source [L/g]: ").strip().lower()
+        if sub in ("", "l"):
+            repo = _pick_repo()
+            if repo is None or repo == "__init__":
+                return
+            repo = _resolve_and_confirm_recursive(repo)
+            if repo is None:
+                return
+        elif sub == "g":
+            target = _pick_github_repo(visibility="all", allow_delete=False)
+            if not target:
+                return
+            # Find matching local clone (by remote URL), otherwise offer to clone.
+            owner, name = target.split("/", 1)
+            local = _find_local_clone_for(owner, name)
+            if local:
+                repo = _resolve_and_confirm_recursive(local)
+                if repo is None:
+                    return
+            else:
+                print(f"[i] No local clone of {target} found.")
+                if input("    Clone it now? [Y/n]: ").strip().lower() in ("", "y", "yes"):
+                    dest = Path.home() / name
+                    if dest.exists():
+                        print(f"[!] {dest} already exists.")
+                        return
+                    rc, _ = _run_streaming(["git", "clone", f"https://github.com/{target}.git", str(dest)])
+                    if rc == 0:
+                        repo = dest
+                    else:
+                        print("[!] Clone failed.")
+                        return
+                else:
+                    return
+        else:
+            return
+        _action_menu(repo)
+        return
     if action in ("push", "pull"):
         msg = input("Commit message: ").strip() or ("update" if action == "push" else "")
         if action == "push":
@@ -1194,11 +1504,51 @@ def interactive():
             cmd_pull(repo, msg)
 
 
+def _resolve_and_confirm_recursive(r) -> Path | None:
+    """Confirm a repo; on switch/s, fall through to the local picker again.
+    Returns the confirmed Path or None on abort."""
+    while True:
+        result = _confirm_repo(r)
+        if result is True:
+            return r
+        if result is None:
+            return None
+        picked = _pick_repo()
+        if picked is None or picked == "__init__":
+            return None
+        r = picked
+
+
+def _find_local_clone_for(owner: str, name: str) -> Path | None:
+    """Walk ~/devtool siblings for a clone whose remote matches owner/name."""
+    SKIP = {"devtool", ".cursor", ".config", ".local", "AppData", "Downloads"}
+    target_urls = {
+        f"https://github.com/{owner}/{name}",
+        f"git@github.com:{owner}/{name}.git",
+    }
+    try:
+        for sibling in Path.home().iterdir():
+            if sibling.name in SKIP or not sibling.is_dir():
+                continue
+            for root, dirs, _files in os.walk(sibling):
+                if ".git" in dirs:
+                    rp = Path(root)
+                    url = _get_remote_url(rp) or ""
+                    url_norm = url.removesuffix(".git")
+                    if url_norm in target_urls or url in target_urls:
+                        return rp
+                    dirs.clear()
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+    except OSError:
+        pass
+    return None
+
+
 # ── Main ─────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="GitHub CLI: push, pull, new, init.")
-    parser.add_argument("command", nargs="?", help="push, pull, new, init, status, wipe")
+    parser = argparse.ArgumentParser(description="GitHub CLI: push, pull, new, init, list, delete.")
+    parser.add_argument("command", nargs="?", help="push, pull, new, init, status, wipe, list, delete")
     parser.add_argument("arg", nargs="?", help="repo name or commit message")
     parser.add_argument("-p", "--private", action="store_true", default=True,
                         help="make repo private (default: True)")
@@ -1208,6 +1558,14 @@ def main():
                         help="new: also git init + push local files to the new repo")
     parser.add_argument("--no-push", dest="push_local", action="store_false",
                         help="init: skip git init + push (create remote repo only)")
+    parser.add_argument("--visibility", choices=["all", "public", "private"], default="all",
+                        help="list: filter by visibility (default: all)")
+    parser.add_argument("--affiliation", default="owner,collaborator,organization_member",
+                        help="list: comma-separated affiliations (default: owner,collaborator,organization_member)")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="delete: skip the double y/N confirmation (DANGEROUS)")
+    parser.add_argument("-i", "--interactive", action="store_true",
+                        help="delete: pick a repo from your GitHub list")
     args = parser.parse_args()
 
     if not args.command:
@@ -1257,9 +1615,25 @@ def main():
             sys.exit(1)
         cmd_wipe_remote(repo)
 
+    elif cmd == "list":
+        cmd_list(visibility=args.visibility, affiliation=args.affiliation)
+
+    elif cmd == "delete":
+        if args.interactive:
+            cmd_delete_picker(visibility=args.visibility, affiliation=args.affiliation)
+        else:
+            if not args.arg:
+                print("[!] Usage: gh delete <repo>     (or  gh delete <owner>/<repo>)")
+                print("    To pick from your repos:  gh delete -i")
+                sys.exit(1)
+            if args.yes:
+                print("[!] --yes is not supported for safety. Run without it and answer y/N twice.")
+                sys.exit(2)
+            cmd_delete(args.arg)
+
     else:
         print(f"[!] Unknown command: {cmd}")
-        print("    Available: push, pull, new, init, status, wipe")
+        print("    Available: push, pull, new, init, status, wipe, list, delete")
         print("    Or run 'gh' for interactive menu.")
 
 
