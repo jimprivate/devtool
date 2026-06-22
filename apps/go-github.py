@@ -160,6 +160,18 @@ def _get_remote_url(repo: Path) -> str | None:
     return None
 
 
+def _ensure_lf_preserved(repo: Path) -> None:
+    """core.autocrlf=false + .gitattributes: LF is never rewritten to CRLF. Idempotent."""
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "--local", "core.autocrlf", "false"],
+        capture_output=True, check=True,
+    )
+    attrs = repo / ".gitattributes"
+    if not attrs.exists():
+        attrs.write_text("* text eol=lf\n", encoding="utf-8")
+        print("[+] Created .gitattributes (force LF for all text files)")
+
+
 def _git_env_for(repo: Path) -> dict | None:
     """Try to extract author identity from existing commits in the repo.
     Returns a dict with GIT_AUTHOR_NAME/EMAIL if found."""
@@ -197,8 +209,18 @@ def _prompt_git_identity():
     return name, email
 
 
+def _has_global_git_identity() -> bool:
+    """True if both user.name and user.email are set globally."""
+    name = subprocess.run(["git", "config", "--global", "user.name"], capture_output=True, text=True).stdout.strip()
+    email = subprocess.run(["git", "config", "--global", "user.email"], capture_output=True, text=True).stdout.strip()
+    return bool(name and email)
+
+
 def cmd_push(repo: Path, msg: str):
     """Git add + commit + push."""
+    _ensure_lf_preserved(repo)
+    if not _has_global_git_identity():
+        _prompt_git_identity()
     result = subprocess.run(
         ["git", "-C", str(repo), "status", "--porcelain"],
         capture_output=True, text=True
@@ -209,7 +231,7 @@ def cmd_push(repo: Path, msg: str):
         return
 
     print(f"[+] Committing in {repo.name}...")
-    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
     commit = subprocess.run(
         ["git", "-C", str(repo), "commit", "-m", msg],
         capture_output=True, text=True
@@ -375,15 +397,7 @@ def _push_local(here: Path, username: str, repo_name: str):
     is_new_init = not (here / ".git").exists()
     if is_new_init:
         subprocess.run(["git", "init"], cwd=here, check=True, capture_output=True)
-        # Never rewrite line endings — code must stay as-is across OSes.
-        subprocess.run(
-            ["git", "config", "--local", "core.autocrlf", "false"],
-            cwd=here, check=True, capture_output=True,
-        )
-        attrs = here / ".gitattributes"
-        if not attrs.exists():
-            attrs.write_text("* text=auto eol=lf\n", encoding="utf-8")
-            print("[+] Created .gitattributes (force LF for all text files)")
+    _ensure_lf_preserved(here)
 
     remote_url = f"https://github.com/{username}/{repo_name}.git"
     check_remote = subprocess.run(
