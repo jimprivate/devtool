@@ -487,12 +487,13 @@ def _repo_info(repo: Path) -> str:
 
 def _find_all_repos() -> list[tuple[Path, str, str]]:
     """Scan ~/devtool and its siblings for git repos. Returns (path, name, remote_url)."""
-    candidates = [Path.home() / "devtool"]
+    SKIP_NAMES = {"devtool", ".cursor", ".config", ".local", "AppData", "Downloads"}
+    candidates = []
     try:
         for sibling in Path.home().iterdir():
-            if sibling.name in (".cursor", ".config", ".local", "AppData", "Downloads"):
+            if sibling.name in SKIP_NAMES:
                 continue
-            if sibling.is_dir() and sibling != candidates[0]:
+            if sibling.is_dir():
                 candidates.append(sibling)
     except OSError:
         pass
@@ -601,7 +602,7 @@ def interactive():
         print("[i] Not in a git repo -- picking one for you...")
         repo = _pick_repo()
         if repo is None:
-            print("[!] No git repos found under ~/devtool")
+            print("[!] No git repos found.")
             return
         # If user picked init directly, skip confirm and go straight to action
         if repo == "__init__":
@@ -630,11 +631,9 @@ def interactive():
         ("Pull", "pull", "Fetch and merge latest changes from remote"),
         ("Status", "status", "Show uncommitted changes and remote state"),
         ("Switch repo", "switch", "Pick a different git repo to work with"),
-        ("New GitHub repo", "new", "Create a NEW remote repo on GitHub (separate from this one)"),
-        ("Init here", "init", "Create a NEW remote repo + git init + push local files"),
     ]
     choice = show_menu(choices, header)
-    action = ["push", "pull", "status", "switch", "new", "init"][choice - 1]
+    action = ["push", "pull", "status", "switch"][choice - 1]
 
     if action == "switch":
         repo = _pick_repo()
@@ -652,11 +651,9 @@ def interactive():
             ("Pull", "pull", "Fetch and merge latest changes from remote"),
             ("Status", "status", "Show uncommitted changes and remote state"),
             ("Switch repo", "switch", "Pick a different git repo to work with"),
-            ("New GitHub repo", "new", "Create a NEW remote repo on GitHub (separate from this one)"),
-            ("Init here", "init", "Create a NEW remote repo + git init + push local files"),
         ]
         choice = show_menu(choices, header)
-        action = ["push", "pull", "status", "switch", "new", "init"][choice - 1]
+        action = ["push", "pull", "status", "switch"][choice - 1]
 
     if action == "status":
         cmd_status(repo)
@@ -668,21 +665,6 @@ def interactive():
             cmd_push(repo, msg)
         else:
             cmd_pull(repo, msg)
-    elif action == "new":
-        name = input("Repo name: ").strip()
-        if not name:
-            print("[!] Repo name required.")
-            return
-        priv = input("Private? [Y/n]: ").strip().lower() != "n"
-        push_local = input("Push local files? [y/N]: ").strip().lower() == "y"
-        cmd_new(name, priv, push_local)
-    elif action == "init":
-        name = input("Repo name: ").strip()
-        if not name:
-            print("[!] Repo name required.")
-            return
-        priv = input("Private? [Y/n]: ").strip().lower() != "n"
-        cmd_init(name, priv)
 
 
 # ── Main ─────────────────────────────────────────────────────
