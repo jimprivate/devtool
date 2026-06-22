@@ -21,19 +21,21 @@ Optional subcommands (all pick-from-menu too — these just preset the provider)
 
 One-time setup (Windows PowerShell):
 
-    # Pick a folder already in PATH. C:\\Users\\<you>\\.local\\bin is a safe choice
-    # (Claude CLI's claude.exe already lives there).
-    $LauncherDir = "$env:USERPROFILE\\.local\\bin"
+    # Drop a tiny launcher in a folder already on PATH so you can type
+    # `claude-go` (or `go-claude`) from any directory:
+    $LauncherDir = "$env:USERPROFILE\.local\bin"
     New-Item -ItemType Directory -Force -Path $LauncherDir | Out-Null
     @'
     @echo off
-    python "C:\Users\w11\Downloads\claude-go.py" %*
-    '@ | Out-File -Encoding ascii "$LauncherDir\\claude-go.cmd"
+    py  "C:\path\to\apps\go-claude.py" %*
+    '@ | Out-File -Encoding ascii "$LauncherDir\go-claude.cmd"
 
-    # Then open a NEW PowerShell and run:  claude-go
+    # Then run `go-claude prereq` once — it puts both claude-go's and
+    # claude.exe's directory on user PATH and creates ~/.claude/.
 """
 
 import argparse
+import getpass
 import json
 import os
 import platform
@@ -238,6 +240,59 @@ def reset_provider_key(provider: str) -> None:
             p.unlink()
     os.environ.pop(var, None)
 
+
+def _prompt_api_key(provider: str) -> bool:
+    """Interactively prompt for a missing provider API key, save it, return True on success.
+
+    Self-heal: if the user just picked a provider with no key, ask for it now
+    instead of dumping them back to a shell to run a subcommand manually.
+    Returns False if user aborts or stdin is not a TTY.
+    """
+    ep = ENDPOINTS.get(provider)
+    if not ep:
+        return False
+    var = ep["api_key_env"]
+
+    if not sys.stdin.isatty():
+        err(f"{var} not set and stdin is not a TTY — cannot prompt")
+        err(f"set it with:  go-claude key {provider} <your-key>")
+        return False
+
+    print()
+    warn(f"{var} is not set for provider '{provider}'.")
+    info(f"  Get a key at: {_key_url(provider)}")
+    print()
+
+    while True:
+        try:
+            value = getpass.getpass(f"  Paste your {provider} API key (input hidden): ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            warn("Aborted.")
+            return False
+        if value:
+            set_provider_key(provider, value)
+            return True
+        print("    Empty. ", end="")
+        try:
+            retry = input("Try again? [Y/n]: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            warn("Aborted.")
+            return False
+        if retry == "n":
+            print()
+            warn(f"Aborted. Run later:  go-claude key {provider} <your-key>")
+            return False
+
+
+def _key_url(provider: str) -> str:
+    return {
+        "deepseek":   "https://platform.deepseek.com/api_keys",
+        "openrouter": "https://openrouter.ai/settings/keys",
+        "anthropic":  "https://console.anthropic.com/settings/keys",
+    }.get(provider, "your provider's console")
+
 def set_model(provider: str, model: str) -> bool:
     ep = ENDPOINTS.get(provider)
     if not ep:
@@ -246,8 +301,11 @@ def set_model(provider: str, model: str) -> bool:
 
     api_key = get_provider_key(provider)
     if not api_key:
-        err(f"{ep['api_key_env']} not set. Run `python claude-go.py key {provider} <your-key>`")
-        return False
+        if not _prompt_api_key(provider):
+            return False
+        api_key = get_provider_key(provider)
+        if not api_key:
+            return False
 
     model_id = ep["models"].get(model)
     if not model_id:
@@ -545,11 +603,19 @@ def _launch_claude(extra_argv: list[str]) -> int:
 
     claude_bin = find_claude()
     if not claude_bin:
-        warn("claude CLI not found in PATH — set provider env, but skipping launch.")
+        warn("claude CLI not found.")
         warn("install: https://claude.com/download   (or: npm i -g @anthropic-ai/claude-code)")
+        warn("if you just installed it, REOPEN your PowerShell / cmd and run go-claude again.")
         return 2
+    if platform.system() == "Windows":
+        user = _user_path_windows()
+        claude_dir = str(Path(claude_bin).resolve().parent)
+        if claude_dir.lower() not in {p.lower() for p in user.split(";") if p}:
+            if ensure_dir_on_path(claude_dir, label="claude CLI"):
+                warn("REOPEN your PowerShell / cmd so `claude` resolves from PATH.")
 
     cmd = [claude_bin, *extra_argv]
+    _augment_path_from_registry()
     print()
     info(f"$ {' '.join(cmd)}")
     print()
@@ -602,7 +668,39 @@ def latest_log_mtime() -> float:
     return best
 
 def find_claude() -> str | None:
-    return shutil.which("claude")
+    r"""Locate the `claude` binary.
+
+    Order:
+      1. shutil.which("claude") — uses current process PATH + PATHEXT.
+      2. Well-known install dirs Claude Code's installer / npm shim into,
+         even when not yet on PATH (fresh PowerShell after install).
+    Returns the full path string, or None if nothing was found.
+    """
+    found = shutil.which("claude")
+    if found:
+        return found
+
+    if platform.system() != "Windows":
+        candidates = [
+            home() / ".local" / "bin" / "claude",
+            Path("/usr/local/bin/claude"),
+            Path("/opt/homebrew/bin/claude"),
+        ]
+    else:
+        candidates = [
+            home() / ".local" / "bin" / "claude.exe",
+            home() / "AppData" / "Roaming" / "npm" / "claude.cmd",
+            home() / "AppData" / "Roaming" / "npm" / "claude.exe",
+            home() / "AppData" / "Local" / "Programs" / "claude" / "claude.exe",
+            Path("C:/Program Files/claude/claude.exe"),
+        ]
+    for c in candidates:
+        try:
+            if c.is_file():
+                return str(c)
+        except OSError:
+            continue
+    return None
 
 def ensure_skeleton() -> None:
     """Create ~/.claude/ and a minimal settings.json if missing.
@@ -620,12 +718,28 @@ def ensure_skeleton() -> None:
         ok(f"{sp} already exists")
 
 def check_claude_cli() -> bool:
+    r"""Verify `claude` resolves. If it does but its directory is not yet on
+    the persistent user PATH, add it (so a future shell picks it up).
+    Returns True if `claude` is callable from this process.
+    """
     c = find_claude()
-    if c:
-        ok(f"claude CLI: {c}")
-        return True
-    warn("claude CLI not found in PATH")
-    return False
+    if not c:
+        warn("claude CLI not found")
+        warn("install: https://claude.com/download   (or: npm i -g @anthropic-ai/claude-code)")
+        return False
+    ok(f"claude CLI: {c}")
+    claude_dir = str(Path(c).resolve().parent)
+    sysname = platform.system()
+    if sysname == "Windows":
+        user = _user_path_windows()
+        if claude_dir.lower() not in {p.lower() for p in user.split(";") if p}:
+            if ensure_dir_on_path(claude_dir, label="claude CLI"):
+                warn("Claude CLI directory is now on user PATH; reopen your shell to use it from `claude`.")
+    else:
+        proc = os.environ.get("PATH", "")
+        if claude_dir not in proc.split(os.pathsep):
+            ensure_dir_on_path(claude_dir, label="claude CLI")
+    return True
 
 # ---------- PATH self-install (one-time, idempotent) ----------
 
@@ -638,6 +752,27 @@ def _user_path_windows() -> str:
             return val or ""
     except (OSError, ImportError):
         return os.environ.get("PATH", "")
+
+def _augment_path_from_registry() -> None:
+    r"""Merge HKCU\Environment\PATH into the current process PATH on Windows.
+
+    A fresh PowerShell snapshots PATH at startup. Anything added to user
+    PATH after that is invisible to the process and any child it spawns
+    (e.g. `claude` shelling out to git/node). Reading the registry and
+    prepending the missing entries fixes that for this run only — the user
+    still needs to reopen the shell for it to be permanent.
+    """
+    if platform.system() != "Windows":
+        return
+    user_path = _user_path_windows()
+    if not user_path:
+        return
+    proc_parts = {p.lower() for p in os.environ.get("PATH", "").split(os.pathsep) if p}
+    extras = [p for p in user_path.split(";") if p and p.lower() not in proc_parts]
+    if not extras:
+        return
+    os.environ["PATH"] = os.pathsep.join(extras + [os.environ.get("PATH", "")])
+    info(f"merged {len(extras)} PATH entr(y/ies) from HKCU\\Environment for this run")
 
 def _set_user_path_windows(extra: str) -> bool:
     r"""Append `extra` to HKCU\Environment\PATH. Returns True if changed."""
@@ -663,6 +798,44 @@ def _set_user_path_windows(extra: str) -> bool:
         warn(f"could not update user PATH: {e}")
         return False
 
+def ensure_dir_on_path(directory: str, label: str = "directory") -> bool:
+    r"""Persistently add `directory` to the user's PATH if not already there.
+
+    Cross-platform. Idempotent. Returns True if PATH was modified.
+    `label` is used in the user-facing message ("<label> directory").
+    """
+    if not directory:
+        return False
+    if platform.system() == "Windows":
+        proc = os.environ.get("PATH", "")
+        if directory.lower() in {p.lower() for p in proc.split(os.pathsep) if p}:
+            return False
+        user = _user_path_windows()
+        if directory.lower() in {p.lower() for p in user.split(";") if p}:
+            return False
+        if _set_user_path_windows(directory):
+            ok(f"added {label} to user PATH: {directory}")
+            warn("REOPEN your PowerShell / cmd to pick this up.")
+            return True
+        warn(f"could not add {label} to user PATH automatically: {directory}")
+        return False
+
+    proc = os.environ.get("PATH", "")
+    if directory in proc.split(os.pathsep):
+        return False
+    rc = home() / ".profile"
+    if not rc.exists():
+        for cand in (home() / ".bash_profile", home() / ".bashrc", home() / ".zshrc"):
+            if cand.exists():
+                rc = cand
+                break
+    if _add_to_shell_rc(directory, rc):
+        ok(f"added {label} to {rc}: {directory}")
+        warn(f"REOPEN your shell, or run:  source {rc}")
+        return True
+    info(f"{label} already on PATH: {directory}")
+    return False
+
 def _add_to_shell_rc(extra: str, rcfile: Path) -> bool:
     """Append export PATH=...:$PATH to a POSIX rc file. Idempotent."""
     line = f'export PATH="{extra}:$PATH"'
@@ -683,47 +856,12 @@ def _add_to_shell_rc(extra: str, rcfile: Path) -> bool:
         return False
 
 def ensure_self_in_path() -> None:
-    """If this script's directory is not on PATH, add it.
+    r"""If this script's directory is not on PATH, add it persistently.
 
-    Windows: HKCU Environment (persistent, picks up on next shell).
-    POSIX  : append to ~/.profile (the one file that bash/zsh/dash all
-             source on login shells).
-    Idempotent: a second run is a no-op.
+    Idempotent: a second run is a no-op. Uses ensure_dir_on_path() so the
+    same helper can also fix Claude CLI's directory later.
     """
-    here = str(Path(__file__).resolve().parent)
-    sysname = platform.system()
-
-    if sysname == "Windows":
-        proc = os.environ.get("PATH", "")
-        if here.lower() in {p.lower() for p in proc.split(os.pathsep) if p}:
-            return
-        user = _user_path_windows()
-        if here.lower() in {p.lower() for p in user.split(";") if p}:
-            info(f"already in user PATH (takes effect on next shell): {here}")
-            return
-        if _set_user_path_windows(here):
-            ok(f"added to user PATH: {here}")
-            warn("REOPEN your PowerShell / cmd to pick this up.")
-        else:
-            warn(f"could not add {here} to user PATH automatically")
-        return
-
-    # POSIX: ~/.profile is universal; .bashrc/.zshrc are interactive-only.
-    proc = os.environ.get("PATH", "")
-    if here in proc.split(os.pathsep):
-        return
-
-    rc = home() / ".profile"
-    if not rc.exists():
-        for cand in (home() / ".bash_profile", home() / ".bashrc", home() / ".zshrc"):
-            if cand.exists():
-                rc = cand
-                break
-    if _add_to_shell_rc(here, rc):
-        ok(f"added to {rc}: {here}")
-        warn(f"REOPEN your shell, or run:  source {rc}")
-    else:
-        info(f"already on PATH: {here}")
+    ensure_dir_on_path(str(Path(__file__).resolve().parent), label="claude-go")
 
 def prereq_check() -> None:
     print()
@@ -747,6 +885,8 @@ def prereq_check() -> None:
     print()
     ok("Done.")
     print()
+    _augment_path_from_registry()
+    info("PATH for this run is now current. For future shells, REOPEN PowerShell/cmd.")
     info("Next time, you can just run:  claude-go  (or  python claude-go.py)")
     _print_siblings(Path(__file__).resolve())
     print()

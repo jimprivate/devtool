@@ -188,24 +188,57 @@ def _git_env_for(repo: Path) -> dict | None:
     return {"GIT_AUTHOR_EMAIL": email, "GIT_AUTHOR_NAME": name, "GIT_COMMITTER_EMAIL": email, "GIT_COMMITTER_NAME": name}
 
 
-def _prompt_git_identity():
-    """Ask user for git identity, save globally, return (name, email)."""
+def _prompt_git_identity() -> tuple[str, str] | None:
+    """Ensure global git user.name and user.email are set. Prompt if missing.
+
+    Self-heal: instead of crashing with `Author identity unknown`, ask
+    the user and save to ~/.gitconfig in one step. Returns (name, email)
+    on success, or None if the user aborted or stdin is not a TTY.
+    """
+    git = shutil.which("git") or "git"
+
+    name_r = subprocess.run([git, "config", "--global", "user.name"],
+                            capture_output=True, text=True)
+    email_r = subprocess.run([git, "config", "--global", "user.email"],
+                             capture_output=True, text=True)
+    cur_name = name_r.stdout.strip()
+    cur_email = email_r.stdout.strip()
+
+    if cur_name and cur_email:
+        info(f"    git identity: {cur_name} <{cur_email}>")
+        return cur_name, cur_email
+
+    if not sys.stdin.isatty():
+        err("Git identity not configured and stdin is not a TTY — cannot prompt.")
+        err(f"Set it with:")
+        err(f"  git config --global user.name  \"Your Name\"")
+        err(f"  git config --global user.email \"you@example.com\"")
+        return None
+
     print()
-    print("    git needs your identity for commits.")
+    warn("    git needs your identity for commits.")
     while True:
-        name = input("    Git user.name: ").strip()
+        try:
+            name = input(f"    Git user.name [{cur_name or 'required'}]: ").strip() or cur_name
+        except (KeyboardInterrupt, EOFError):
+            print("\n    Aborted.")
+            return None
         if name:
             break
         print("    Required.")
     while True:
-        email = input("    Git user.email (GitHub login email): ").strip()
+        try:
+            email = input(f"    Git user.email (GitHub login email) [{cur_email or 'required'}]: ").strip() or cur_email
+        except (KeyboardInterrupt, EOFError):
+            print("\n    Aborted.")
+            return None
         if email:
             break
         print("    Required.")
 
-    subprocess.run(["git", "config", "--global", "user.name", name], check=True)
-    subprocess.run(["git", "config", "--global", "user.email", email], check=True)
-    print(f"    Saved to ~/.gitconfig.")
+    subprocess.run([git, "config", "--global", "user.name", name], check=True)
+    subprocess.run([git, "config", "--global", "user.email", email], check=True)
+    ok(f"    Saved to ~/.gitconfig: {name} <{email}>")
     return name, email
 
 
@@ -268,6 +301,71 @@ def _run_streaming(cmd: list[str], cwd: Path | None = None,
     return proc.returncode, "".join(captured)
 
 
+def _list_large_files_in_history(repo: Path, threshold_mb: int = 100) -> list[tuple[str, float]]:
+    """Scan all reachable commits for blobs exceeding threshold.
+    Uses `git rev-list --objects --all` + `git cat-file --batch-check` to be fast.
+    Returns [(path, size_mb), ...] deduped by path, largest first."""
+    threshold = threshold_mb * 1024 * 1024
+    # Get every (oid, path) in history
+    r = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--objects", "--all"],
+        capture_output=True, text=True, errors="replace",
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return []
+    # Build {oid: [paths...]}
+    oid_paths: dict[str, list[str]] = {}
+    for line in r.stdout.splitlines():
+        parts = line.split(" ", 1)
+        if len(parts) == 2:
+            oid, path = parts
+            oid_paths.setdefault(oid, []).append(path)
+    if not oid_paths:
+        return []
+    # Batch-check sizes
+    input_data = "\n".join(oid_paths.keys()).encode("utf-8")
+    r2 = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)"],
+        input=input_data, capture_output=True,
+    )
+    big_by_path: dict[str, int] = {}
+    for line in r2.stdout.decode("utf-8", errors="ignore").splitlines():
+        parts = line.split(" ", 2)
+        if len(parts) < 3:
+            continue
+        oid, otype, size_s = parts
+        if otype != "blob":
+            continue
+        try:
+            size = int(size_s)
+        except ValueError:
+            continue
+        if size > threshold:
+            for path in oid_paths.get(oid, []):
+                if size > big_by_path.get(path, 0):
+                    big_by_path[path] = size
+    big = [(p, s / 1024 / 1024) for p, s in big_by_path.items()]
+    big.sort(key=lambda x: -x[1])
+    return big
+
+
+def _lfs_tracked_patterns(repo: Path) -> list[str]:
+    """Read .gitattributes and return patterns marked as LFS (filter=lfs)."""
+    ga = repo / ".gitattributes"
+    if not ga.exists():
+        return []
+    patterns = []
+    for line in ga.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "filter=lfs" in line:
+            # First whitespace-separated token is the pattern
+            pat = line.split()[0]
+            patterns.append(pat)
+    return patterns
+
+
 def _list_large_files(repo: Path, threshold_mb: int = 100) -> list[tuple[str, float]]:
     """Return [(path, size_mb), ...] for files that would be pushed and exceed threshold.
     Looks at working-tree files that are tracked OR staged."""
@@ -291,6 +389,12 @@ def _list_large_files(repo: Path, threshold_mb: int = 100) -> list[tuple[str, fl
             if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch("/" + rel, "/" + pat):
                 return True
         return False
+    import fnmatch
+    # Files matched by LFS patterns in .gitattributes will be turned into pointers
+    # at commit time, so their working-tree size is irrelevant.
+    lfs_patterns = _lfs_tracked_patterns(repo)
+    def _is_lfs_tracked(rel: str) -> bool:
+        return any(fnmatch.fnmatch(rel, pat) for pat in lfs_patterns)
     for p in repo.rglob("*"):
         if not p.is_file():
             continue
@@ -301,6 +405,8 @@ def _list_large_files(repo: Path, threshold_mb: int = 100) -> list[tuple[str, fl
         if "/.git/" in "/" + rel or rel.startswith(".git/"):
             continue
         if _is_ignored(rel):
+            continue
+        if _is_lfs_tracked(rel):
             continue
         # Skip our own push tools and __pycache__
         if rel.startswith("apps/") and rel.endswith(".py"):
@@ -315,8 +421,84 @@ def _list_large_files(repo: Path, threshold_mb: int = 100) -> list[tuple[str, fl
     return big
 
 
+def _has_remote(repo: Path) -> bool:
+    """True if `origin` (or any remote) is configured."""
+    r = subprocess.run(
+        ["git", "-C", str(repo), "remote"],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0 and bool(r.stdout.strip())
+
+
+def _prompt_set_remote(repo: Path) -> bool:
+    """Offer to set origin to a GitHub repo from the user's account.
+    Returns True if origin was set (or already correct), False if user aborted."""
+    token = get_token()
+    if not token:
+        return False
+    user_data = http_get(f"{GITHUB_API}/user", token)
+    username = json.loads(user_data)["login"]
+
+    print()
+    warn(f"No remote configured for {repo.name}.")
+    repos = _list_user_repos(token, username)
+    if repos:
+        info(f"  Your GitHub repos (newest first):")
+        for i, (name, url) in enumerate(repos[:15], 1):
+            print(f"    [{i}] {name}")
+        if len(repos) > 15:
+            print(f"    ... and {len(repos) - 15} more")
+        info(f"    [N] Type a different repo name")
+    else:
+        info("  No repos on your GitHub account yet.")
+
+    val = input("Repo to push to (blank to cancel): ").strip()
+    if not val:
+        print("[i] Aborted.")
+        return False
+
+    if val.isdigit() and repos and 1 <= int(val) <= min(len(repos), 15):
+        repo_name = repos[int(val) - 1][0]
+    else:
+        repo_name = val
+
+    remote_url = f"https://github.com/{username}/{repo_name}.git"
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", remote_url],
+        check=True, capture_output=True,
+    )
+    ok(f"Set origin = {remote_url}")
+    return True
+
+
+def _list_user_repos(token: str, username: str) -> list[tuple[str, str]]:
+    """List the user's repos, newest first. Returns [(name, html_url), ...]."""
+    try:
+        data = http_get(f"{GITHUB_API}/users/{username}/repos?per_page=30&sort=created&direction=desc",
+                        token, params={"type": "owner"})
+        items = json.loads(data)
+        return [(it["name"], it["html_url"]) for it in items if isinstance(it, dict) and "name" in it]
+    except (HttpError, json.JSONDecodeError, urllib.error.URLError):
+        return []
+
+
 def _push_only(repo: Path) -> None:
-    """Push current branch, with upstream auto-fix."""
+    """Push current branch, with upstream auto-fix and remote auto-setup."""
+    if not _has_remote(repo):
+        warn(f"No remote configured for {repo.name}.")
+        if sys.stdin.isatty():
+            choice = input("  Set one now? [Y/n]: ").strip().lower()
+            if choice in ("", "y", "yes"):
+                if not _prompt_set_remote(repo):
+                    print("[!] Push aborted — no remote.")
+                    return
+            else:
+                print("[!] Push aborted — no remote.")
+                return
+        else:
+            print("[!] No remote configured. Run:  git -C \"<repo>\" remote add origin <url>")
+            return
+
     print(f"[+] Pushing to remote...\n", end="")
     rc, stderr = _run_streaming(["git", "-C", str(repo), "push"])
     if rc != 0 and "no upstream branch" in stderr:
@@ -328,6 +510,9 @@ def _push_only(repo: Path) -> None:
         rc, stderr = _run_streaming(["git", "-C", str(repo), "push", "--set-upstream", "origin", branch])
     if rc != 0:
         print(f"[!] Push failed (exit {rc}).")
+        # Common auth/identity failure: surface a hint.
+        if "could not read Username" in stderr or "terminal prompts disabled" in stderr:
+            info("    Hint: set a token via:  gh new <repo>   (will prompt for token)")
         return
     web_url = _get_remote_url(repo)
     print(f"[+] Done." + (f"  {web_url}" if web_url else ""))
@@ -436,6 +621,25 @@ def cmd_push(repo: Path, msg: str):
     _ensure_lf_preserved(repo)
     if not _has_global_git_identity():
         _prompt_git_identity()
+    # First check files already in history (LFS cannot fix these after-the-fact)
+    hist_big = _list_large_files_in_history(repo, 100)
+    if hist_big:
+        print(f"[!] {len(hist_big)} file(s) in your git history exceed 100 MB.")
+        print("    LFS cannot retroactively migrate these — GitHub will reject the push.")
+        for rel, mb in hist_big[:10]:
+            print(f"    {rel}  ({mb:.1f} MB)")
+        if len(hist_big) > 10:
+            print(f"    ... and {len(hist_big) - 10} more")
+        exts = sorted({Path(rel).suffix for rel, _ in hist_big if Path(rel).suffix})
+        ext_pattern = ",".join(f"*{e}" for e in exts) if exts else ""
+        if ext_pattern:
+            print(f"    Fix: git lfs migrate import --include=\"{ext_pattern}\" --everything")
+        else:
+            print("    Fix: git lfs migrate import --everything")
+        print("    (Or wipe remote history and start fresh with LFS from the start.)")
+        if input("    Continue anyway (will likely fail)? [y/N] ").strip().lower() != "y":
+            print("[i] Aborted. Run the migrate command above, then retry.")
+            return
     big = _list_large_files(repo, 100)
     if big:
         if not _handle_large_files(repo, big):
@@ -446,15 +650,8 @@ def cmd_push(repo: Path, msg: str):
     ).stdout.strip()
 
     if not result:
-        print("[+] Nothing to commit.")
-        ans = input("    Force empty commit + push? [y/N] ").strip().lower()
-        if ans != "y":
-            print("[i] Skipped.")
-            return
-        subprocess.run(
-            ["git", "-C", str(repo), "commit", "--allow-empty", "-m", msg],
-            check=True, capture_output=True,
-        )
+        # Nothing to commit, but maybe LFS objects still need to be pushed (e.g. after
+        # `git lfs migrate`). Just push whatever is on the branch.
         return _push_only(repo)
 
     print(f"[+] Committing in {repo.name}...")
@@ -576,31 +773,14 @@ def cmd_init(repo_name: str, private: bool = True, push_local: bool = True):
     _push_local(Path.cwd(), username, repo_name)
 
 
-def _get_git_identity():
-    """Prompt for git identity if not set, save globally."""
-    git = shutil.which("git") or "git"
-
-    name_result = subprocess.run([git, "config", "--global", "user.name"], capture_output=True, text=True)
-    email_result = subprocess.run([git, "config", "--global", "user.email"], capture_output=True, text=True)
-
-    if name_result.stdout.strip() and email_result.stdout.strip():
-        return
-
-    print()
-    print("[!] Git identity not configured.")
-    name = input("  git user.name: ").strip()
-    email = input("  git user.email: ").strip()
-    if not name or not email:
-        print("[!] Both name and email are required to commit.")
-        return
-
-    subprocess.run([git, "config", "--global", "user.name", name], check=True)
-    subprocess.run([git, "config", "--global", "user.email", email], check=True)
-    print(f"[+] Git identity saved: {name} <{email}>")
-
-
 def _push_local(here: Path, username: str, repo_name: str):
     """Git init + remote + add + commit + push from an existing directory."""
+    # Pre-check git identity so the commit step doesn't fail-and-recover.
+    if not _has_global_git_identity():
+        if _prompt_git_identity() is None:
+            print("[!] Cannot commit without a git identity.")
+            return
+
     # On Windows / network drives, git refuses -C into paths it considers
     # "dubious ownership". Whitelist the directory once, globally.
     here_str = str(here.resolve()).replace("\\", "/")
@@ -652,7 +832,10 @@ def _push_local(here: Path, username: str, repo_name: str):
         if commit_result.returncode == 0:
             print("[+] First commit created.")
         elif "Author identity unknown" in commit_result.stderr:
-            _get_git_identity()
+            # Pre-check passed but commit still failed (race / config layer) — try once more.
+            if _prompt_git_identity() is None:
+                print("[!] Commit aborted — no git identity.")
+                return
             commit_result = subprocess.run(
                 ["git", "-C", str(here), "commit", "-m", "Initial commit"],
                 capture_output=True, text=True
