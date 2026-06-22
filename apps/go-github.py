@@ -159,6 +159,43 @@ def _get_remote_url(repo: Path) -> str | None:
     return None
 
 
+def _git_env_for(repo: Path) -> dict | None:
+    """Try to extract author identity from existing commits in the repo.
+    Returns a dict with GIT_AUTHOR_NAME/EMAIL if found."""
+    r = subprocess.run(
+        ["git", "-C", str(repo), "log", "-1", "--format=%ae%n%an"],
+        capture_output=True, text=True
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    parts = r.stdout.strip().split("\n", 1)
+    if len(parts) < 2:
+        return None
+    email, name = parts
+    return {"GIT_AUTHOR_EMAIL": email, "GIT_AUTHOR_NAME": name, "GIT_COMMITTER_EMAIL": email, "GIT_COMMITTER_NAME": name}
+
+
+def _prompt_git_identity():
+    """Ask user for git identity, save globally, return (name, email)."""
+    print()
+    print("    git needs your identity for commits.")
+    while True:
+        name = input("    Git user.name: ").strip()
+        if name:
+            break
+        print("    Required.")
+    while True:
+        email = input("    Git user.email (GitHub login email): ").strip()
+        if email:
+            break
+        print("    Required.")
+
+    subprocess.run(["git", "config", "--global", "user.name", name], check=True)
+    subprocess.run(["git", "config", "--global", "user.email", email], check=True)
+    print(f"    Saved to ~/.gitconfig.")
+    return name, email
+
+
 def cmd_push(repo: Path, msg: str):
     """Git add + commit + push."""
     result = subprocess.run(
@@ -172,15 +209,49 @@ def cmd_push(repo: Path, msg: str):
 
     print(f"[+] Committing in {repo.name}...")
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(repo), "commit", "-m", msg], check=True, capture_output=True)
-    push = subprocess.run(["git", "-C", str(repo), "push"])
-    if push.returncode == 0:
-        web_url = _get_remote_url(repo)
-        print(f"[+] Pushed.")
-        if web_url:
-            print(f"  -> {web_url}")
-    else:
-        print(f"[!] Push failed.")
+    commit = subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", msg],
+        capture_output=True, text=True
+    )
+    if commit.returncode != 0:
+        stderr = commit.stderr.strip()
+        if "Author identity unknown" in stderr or "please tell me who you are" in stderr.lower():
+            env_vars = _git_env_for(repo)
+            if env_vars:
+                print("[i] No global git identity. Detected from repo history — using it once.")
+                commit = subprocess.run(
+                    ["git", "-C", str(repo), "commit", "-m", msg],
+                    capture_output=True, text=True,
+                    env={**os.environ, **env_vars}
+                )
+                if commit.returncode != 0:
+                    _prompt_git_identity()
+                    subprocess.run(
+                        ["git", "-C", str(repo), "commit", "-m", msg],
+                        check=True, capture_output=True
+                    )
+            else:
+                print("[!] No global git identity and no repo history.")
+                _prompt_git_identity()
+                subprocess.run(
+                    ["git", "-C", str(repo), "commit", "-m", msg],
+                    check=True, capture_output=True
+                )
+        else:
+            print(f"[!] Commit failed:\n{stderr}")
+            return
+
+    print(f"[+] Pushing to remote...")
+    push = subprocess.run(
+        ["git", "-C", str(repo), "push"],
+        capture_output=True, text=True
+    )
+    if push.returncode != 0:
+        print(f"[!] Push failed (exit {push.returncode}):\n{push.stderr.strip()}")
+        return
+
+    web_url = _get_remote_url(repo)
+    print(f"[+] Done." + (f"  {web_url}" if web_url else ""))
 
 
 def cmd_new(repo_name: str, private: bool = True, push_local: bool = False):
@@ -377,45 +448,199 @@ def show_menu(choices: list[tuple[str, str, str]], header: str) -> int:
         print("Invalid, try again.")
 
 
+def _repo_info(repo: Path) -> str:
+    """Return a one-line summary of the repo's remote identity."""
+    branch = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--show-current"],
+        capture_output=True, text=True
+    ).stdout.strip() or "(detached)"
+
+    remote_url = _get_remote_url(repo)
+    if remote_url:
+        return f"  -> {remote_url}  [{branch}]"
+    return f"  -> (no remote)  [{branch}]"
+
+
+def _find_all_repos() -> list[tuple[Path, str, str]]:
+    """Scan ~/devtool and its siblings for git repos. Returns (path, name, remote_url)."""
+    candidates = [Path.home() / "devtool"]
+    try:
+        for sibling in Path.home().iterdir():
+            if sibling.name in (".cursor", ".config", ".local", "AppData", "Downloads"):
+                continue
+            if sibling.is_dir() and sibling != candidates[0]:
+                candidates.append(sibling)
+    except OSError:
+        pass
+
+    found = []
+    seen_urls = set()
+    for base in candidates:
+        try:
+            for root, dirs, files in os.walk(base):
+                if ".git" in dirs:
+                    rp = Path(root)
+                    url = _get_remote_url(rp) or "(no remote)"
+                    name = rp.name
+                    if url not in seen_urls:
+                        found.append((rp, name, url))
+                        seen_urls.add(url)
+                    dirs.clear()
+                dirs[:] = [d for d in dirs if not d.startswith(".")]
+        except OSError:
+            pass
+    return found
+
+
+def _pick_repo() -> Path | None:
+    """Interactive repo picker. Returns chosen Path or None."""
+    repos = _find_all_repos()
+    if not repos:
+        return None
+
+    print()
+    print("[ Pick a repo ]")
+    print("-" * 50)
+    for i, (rp, name, url) in enumerate(repos, 1):
+        print(f"  {i}. {name}")
+        print(f"     {url}")
+    print(f"  0. Exit")
+    print()
+
+    while True:
+        val = input("Select: ").strip()
+        if val == "0":
+            sys.exit(0)
+        try:
+            n = int(val)
+            if 1 <= n <= len(repos):
+                return repos[n - 1][0]
+        except ValueError:
+            pass
+        print("Invalid, try again.")
+
+
+def _confirm_repo(repo: Path) -> bool | Path | None:
+    """Ask user to confirm this is the right repo.
+    Returns True (confirmed), False (user wants to switch), None (abort)."""
+    info = _repo_info(repo)
+    print()
+    print(f"[ {repo.name} ]  {info}")
+    print("-" * 50)
+    while True:
+        val = input("Is this the right repo? [Y/n/s(switch)/?]: ").strip().lower()
+        if val in ("", "y", "yes"):
+            return True
+        if val in ("n", "no"):
+            return None
+        if val == "s":
+            return False  # signal to switch
+        if val == "?":
+            cmd_status(repo)
+            print("-" * 50)
+            print(f"[ {repo.name} ]  {info}")
+            print("-" * 50)
+            continue
+        print("Invalid. Type Y, n, s, or ?.")
+
+
 def interactive():
-    """Show context-aware menu based on current directory."""
+    """Confirm repo -> action menu."""
     repo = find_repo_root(Path.cwd())
 
+    def _resolve_and_confirm(r: Path | None) -> Path | None:
+        if r is None:
+            return None
+        result = _confirm_repo(r)
+        if result is True:
+            return r
+        if result is None:
+            return None
+        # result is False — user wants to switch
+        picked = _pick_repo()
+        if picked is None:
+            return None
+        result2 = _confirm_repo(picked)
+        if result2 is True:
+            return picked
+        return None  # keep rejecting
+
     if repo:
-        choice = show_menu([
+        repo = _resolve_and_confirm(repo)
+        if repo is None:
+            print("Aborted.")
+            return
+    else:
+        print("[i] Not in a git repo -- picking one for you...")
+        repo = _pick_repo()
+        if repo is None:
+            print("[!] No git repos found under ~/devtool")
+            return
+        repo = _resolve_and_confirm(repo)
+        if repo is None:
+            print("Aborted.")
+            return
+
+    info = _repo_info(repo)
+    header = f"[ {repo.name} ]  {info}\n[ What to do? ]"
+    choices = [
+        ("Push (commit + push)", "push", "Stage all + commit with a message + push to remote"),
+        ("Pull", "pull", "Fetch and merge latest changes from remote"),
+        ("Status", "status", "Show uncommitted changes and remote state"),
+        ("Switch repo", "switch", "Pick a different git repo to work with"),
+        ("New GitHub repo", "new", "Create a NEW remote repo on GitHub (separate from this one)"),
+        ("Init here", "init", "Create a NEW remote repo + git init + push local files"),
+    ]
+    choice = show_menu(choices, header)
+    action = ["push", "pull", "status", "switch", "new", "init"][choice - 1]
+
+    if action == "switch":
+        repo = _pick_repo()
+        if repo is None:
+            print("[!] No git repos found.")
+            return
+        repo = _resolve_and_confirm(repo)
+        if repo is None:
+            print("Aborted.")
+            return
+        info = _repo_info(repo)
+        header = f"[ {repo.name} ]  {info}\n[ What to do? ]"
+        choices = [
             ("Push (commit + push)", "push", "Stage all + commit with a message + push to remote"),
             ("Pull", "pull", "Fetch and merge latest changes from remote"),
             ("Status", "status", "Show uncommitted changes and remote state"),
-            ("New GitHub repo", "new", "Create a remote repo on GitHub (does not push local files)"),
-            ("New here", "init", "Create a remote repo + init + push all local files in one step"),
-        ], f"[{repo.name}] What to do?")
-        action = ["push", "pull", "status", "new", "init"][choice - 1]
-    else:
-        choice = show_menu([
-            ("New GitHub repo", "new", "Create a remote repo on GitHub (does not push local files)"),
-            ("New here", "init", "Create a remote repo + init + push all local files in one step"),
-        ], "[Not a git repo] What to do?")
-        action = ["new", "init"][choice - 1]
+            ("Switch repo", "switch", "Pick a different git repo to work with"),
+            ("New GitHub repo", "new", "Create a NEW remote repo on GitHub (separate from this one)"),
+            ("Init here", "init", "Create a NEW remote repo + git init + push local files"),
+        ]
+        choice = show_menu(choices, header)
+        action = ["push", "pull", "status", "switch", "new", "init"][choice - 1]
 
-    if action in ("push", "pull", "status"):
+    if action == "status":
+        cmd_status(repo)
+        return
+
+    if action in ("push", "pull"):
+        msg = input("Commit message: ").strip() or ("update" if action == "push" else "")
         if action == "push":
-            msg = input("Commit message: ").strip() or "update"
             cmd_push(repo, msg)
-        elif action == "pull":
-            cmd_pull(repo, "")
         else:
-            cmd_status(repo)
-    else:
+            cmd_pull(repo, msg)
+    elif action == "new":
         name = input("Repo name: ").strip()
         if not name:
             print("[!] Repo name required.")
             return
         priv = input("Private? [Y/n]: ").strip().lower() != "n"
-        if action == "new":
-            push_local = input("Push local files? [y/N]: ").strip().lower() == "y"
-            cmd_new(name, priv, push_local)
-        else:
-            cmd_init(name, priv)
+        push_local = input("Push local files? [y/N]: ").strip().lower() == "y"
+        cmd_new(name, priv, push_local)
+    elif action == "init":
+        name = input("Repo name: ").strip()
+        if not name:
+            print("[!] Repo name required.")
+            return
+        priv = input("Private? [Y/n]: ").strip().lower() != "n"
+        cmd_init(name, priv)
 
 
 # ── Main ─────────────────────────────────────────────────────

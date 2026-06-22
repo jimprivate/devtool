@@ -1,0 +1,45 @@
+---
+description: devtool project conventions — self-healing, install-time checks, no-AI usability
+alwaysApply: true
+---
+
+# devtool Project Conventions
+
+## Core Philosophy
+
+Tools must work for users with NO AI agent, in a fresh environment, from day one. Any error that can be detected at **install time** must be caught and resolved at install time — not deferred to runtime.
+
+## Error Recovery (Runtime)
+
+When a runtime error occurs, the tool must **self-heal** rather than exit with a raw error:
+
+1. Detect the error.
+2. Prompt the user for required input (if possible).
+3. Fix the root cause.
+4. Retry the operation.
+5. Only exit if unrecoverable.
+
+**Bad:** Print git error and exit.
+**Good:** Detect missing identity → prompt user → save to `~/.gitconfig` → retry.
+
+## Install-Time Checklist
+
+When adding a new dependency or capability, the install/update path must:
+
+- Check prerequisites exist (e.g., git identity, network, credentials).
+- Prompt for anything missing and persist it.
+- Never assume the environment is pre-configured.
+
+## User Habit Patterns (w11)
+
+- **Spec out loud:** Describe intent, then implement. Accept feedback to refine.
+- **Think end-to-end:** Considers the scenario where AI is absent. Asks "what if there's no AI?" to stress-test.
+- **Incremental quality:** Fix the immediate bug, then ask "should this be handled at install time too?"
+- **Ownership:** Tells the AI what the project is, expects the AI to reason about consistency across files.
+- **Brief:** Short messages. No need to soften language.
+
+## Code Style
+
+- No redundant comments (no `// Import the module` style).
+- Functions do one thing. Error paths are explicit.
+- Use `subprocess.run(..., capture_output=True, text=True)` for git commands — never let raw errors surface to user.

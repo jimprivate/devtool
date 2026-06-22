@@ -46,6 +46,48 @@ def find_git():
     return shutil.which("git")
 
 
+def _prompt_git_identity():
+    """Ask user for git identity, save globally."""
+    git = find_git()
+    print()
+    print("    git needs your identity for commits.")
+    while True:
+        name = input("    Git user.name: ").strip()
+        if name:
+            break
+        print("    Required.")
+    while True:
+        email = input("    Git user.email (GitHub login email): ").strip()
+        if email:
+            break
+        print("    Required.")
+
+    subprocess.run([git, "config", "--global", "user.name", name], check=True)
+    subprocess.run([git, "config", "--global", "user.email", email], check=True)
+    print(f"    Saved to ~/.gitconfig.")
+
+
+def _check_git_identity():
+    """Ensure global git user.name and user.email are set. Prompt if missing."""
+    git = find_git()
+    if not git:
+        return
+
+    name_r = subprocess.run([git, "config", "--global", "user.name"],
+                           capture_output=True, text=True)
+    email_r = subprocess.run([git, "config", "--global", "user.email"],
+                            capture_output=True, text=True)
+
+    name_ok = name_r.returncode == 0 and name_r.stdout.strip()
+    email_ok = email_r.returncode == 0 and email_r.stdout.strip()
+
+    if name_ok and email_ok:
+        print(f"    git identity: {name_r.stdout.strip()} <{email_r.stdout.strip()}>")
+        return
+
+    _prompt_git_identity()
+
+
 def install_git():
     sysname = platform.system()
     print("[+] git not found. Installing...")
@@ -185,12 +227,27 @@ def remove_from_path():
 
 # ── Commands ─────────────────────────────────────────────────────────────────
 
+def _make_wrappers():
+    """Create .cmd launchers for each .py tool so they work as global commands."""
+    py = "py" if platform.system() == "Windows" else "python3"
+    for py_tool in sorted(APPS_DIR.glob("*.py")):
+        wrapper = py_tool.with_suffix(".cmd")
+        content = f'@echo off\n{py} "%~dp0{py_tool.name}" %*\n'
+        if wrapper.exists():
+            existing = wrapper.read_text(encoding="utf-8", errors="replace")
+            if existing == content:
+                continue
+        wrapper.write_text(content, encoding="utf-8")
+        print(f"    + {wrapper.name}")
+
+
 def cmd_install():
     print()
     print("[ Install ]")
     if not find_git():
         install_git()
         refresh_path()
+    _check_git_identity()
 
     if DEVTOOL_DIR.exists() and (DEVTOOL_DIR / ".git").exists():
         print(f"[+] ~/devtool already exists — pulling latest...")
@@ -208,6 +265,7 @@ def cmd_install():
         print(f"    + {pf.name}")
 
     add_to_path()
+    _make_wrappers()
     print("[+] Install complete.")
 
 
@@ -220,11 +278,13 @@ def cmd_update():
     if not find_git():
         print("[!] git not found.")
         return
+    _check_git_identity()
     print(f"[+] Pulling into ~/devtool...")
     subprocess.run(["git", "-C", str(DEVTOOL_DIR), "pull", "--ff-only"],
                    check=True, capture_output=True)
     for pf in sorted(APPS_DIR.glob("*.py")):
         print(f"    ~ {pf.name}")
+    _make_wrappers()
     print("[+] Update complete.")
 
 
