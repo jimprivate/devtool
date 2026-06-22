@@ -269,6 +269,16 @@ def cmd_push(repo: Path, msg: str):
         ["git", "-C", str(repo), "push"],
         capture_output=True, text=True
     )
+    if push.returncode != 0 and "no upstream branch" in push.stderr:
+        branch = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip() or "master"
+        print(f"[i] Setting upstream to origin/{branch}...")
+        push = subprocess.run(
+            ["git", "-C", str(repo), "push", "--set-upstream", "origin", branch],
+            capture_output=True, text=True,
+        )
     if push.returncode != 0:
         print(f"[!] Push failed (exit {push.returncode}):\n{push.stderr.strip()}")
         return
