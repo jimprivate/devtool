@@ -216,11 +216,230 @@ def _has_global_git_identity() -> bool:
     return bool(name and email)
 
 
+def _run_streaming(cmd: list[str], cwd: Path | None = None,
+                   heartbeat_after: float = 5.0,
+                   heartbeat_interval: float = 10.0) -> tuple[int, str]:
+    """Run a subprocess, streaming output to terminal in real-time while capturing it.
+    Uses char-level reads so \\r progress bars and partial lines update immediately.
+    If subprocess produces no output for `heartbeat_after` seconds, a heartbeat line
+    is printed every `heartbeat_interval` seconds so the user knows it is alive.
+    Returns (returncode, combined_stdout_and_stderr)."""
+    import threading, sys, time
+    proc = subprocess.Popen(
+        cmd, cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=0,
+    )
+    captured: list[str] = []
+    last_output_at = [time.monotonic()]
+    stop_heartbeat = [False]
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
+    def _consume():
+        while True:
+            ch = proc.stdout.read(1)
+            if not ch:
+                break
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+            captured.append(ch)
+            last_output_at[0] = time.monotonic()
+        proc.stdout.close()
+    def _heartbeat():
+        while not stop_heartbeat[0]:
+            time.sleep(heartbeat_interval)
+            if stop_heartbeat[0]:
+                break
+            if proc.poll() is not None:
+                break
+            idle = time.monotonic() - last_output_at[0]
+            if idle >= heartbeat_after:
+                sys.stdout.write(f"\n[...] still working... ({int(idle)}s idle)\n")
+                sys.stdout.flush()
+    t = threading.Thread(target=_consume, daemon=True)
+    h = threading.Thread(target=_heartbeat, daemon=True)
+    t.start()
+    h.start()
+    proc.wait()
+    stop_heartbeat[0] = True
+    t.join(timeout=1)
+    h.join(timeout=1)
+    return proc.returncode, "".join(captured)
+
+
+def _list_large_files(repo: Path, threshold_mb: int = 100) -> list[tuple[str, float]]:
+    """Return [(path, size_mb), ...] for files that would be pushed and exceed threshold.
+    Looks at working-tree files that are tracked OR staged."""
+    threshold = threshold_mb * 1024 * 1024
+    big = []
+    # `git ls-files` lists tracked files; `-c` excludes cached, `-m` modified, etc.
+    # We want everything that would actually go in the next commit, including new untracked ones.
+    # Cheapest approach: walk the working tree and check size + gitignore.
+    import re
+    gi_path = repo / ".gitignore"
+    ignore_patterns: list[str] = []
+    if gi_path.exists():
+        for line in gi_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                ignore_patterns.append(line)
+    def _is_ignored(rel: str) -> bool:
+        for pat in ignore_patterns:
+            # very basic — use fnmatch
+            import fnmatch
+            if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch("/" + rel, "/" + pat):
+                return True
+        return False
+    for p in repo.rglob("*"):
+        if not p.is_file():
+            continue
+        try:
+            rel = p.relative_to(repo).as_posix()
+        except ValueError:
+            continue
+        if "/.git/" in "/" + rel or rel.startswith(".git/"):
+            continue
+        if _is_ignored(rel):
+            continue
+        # Skip our own push tools and __pycache__
+        if rel.startswith("apps/") and rel.endswith(".py"):
+            continue
+        try:
+            size = p.stat().st_size
+        except OSError:
+            continue
+        if size > threshold:
+            big.append((rel, size / 1024 / 1024))
+    big.sort(key=lambda x: -x[1])
+    return big
+
+
+def _push_only(repo: Path) -> None:
+    """Push current branch, with upstream auto-fix."""
+    print(f"[+] Pushing to remote...\n", end="")
+    rc, stderr = _run_streaming(["git", "-C", str(repo), "push"])
+    if rc != 0 and "no upstream branch" in stderr:
+        branch = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip() or "master"
+        print(f"[i] Setting upstream to origin/{branch}...\n", end="")
+        rc, stderr = _run_streaming(["git", "-C", str(repo), "push", "--set-upstream", "origin", branch])
+    if rc != 0:
+        print(f"[!] Push failed (exit {rc}).")
+        return
+    web_url = _get_remote_url(repo)
+    print(f"[+] Done." + (f"  {web_url}" if web_url else ""))
+
+
+def _has_lfs() -> bool:
+    try:
+        return subprocess.run(["git", "lfs", "version"],
+                              capture_output=True).returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def _lfs_install(repo: Path, patterns: list[str]) -> bool:
+    """Run git lfs install + track for given patterns. Returns True on success."""
+    print("[+] Setting up Git LFS...")
+    if subprocess.run(["git", "lfs", "install"], cwd=str(repo),
+                      capture_output=True).returncode != 0:
+        return False
+    ga = repo / ".gitattributes"
+    existing = ga.read_text(encoding="utf-8", errors="ignore") if ga.exists() else ""
+    new_lines = []
+    for pat in patterns:
+        line = f"{pat} filter=lfs diff=lfs merge=lfs -text"
+        if line not in existing:
+            new_lines.append(line)
+    if new_lines:
+        with ga.open("a", encoding="utf-8") as f:
+            if existing and not existing.endswith("\n"):
+                f.write("\n")
+            for line in new_lines:
+                f.write(line + "\n")
+        print(f"[+] Updated .gitattributes")
+    return True
+
+
+def _handle_large_files(repo: Path, big: list[tuple[str, float]]) -> bool:
+    """Interactively resolve >100MB files. Returns True if user wants to continue."""
+    print(f"[!] {len(big)} file(s) exceed GitHub's 100 MB limit:")
+    for rel, mb in big[:10]:
+        print(f"    {rel}  ({mb:.1f} MB)")
+    if len(big) > 10:
+        print(f"    ... and {len(big) - 10} more")
+    print()
+    print("    [1] Skip via .gitignore (recommended)")
+    print("    [2] Set up Git LFS (keeps large files in repo)")
+    print("    [3] Force anyway (GitHub will REJECT the push)")
+    print("    [0] Cancel")
+    choice = input("    Choose [0-3]: ").strip()
+    if choice == "0" or not choice:
+        print("[i] Aborted.")
+        return False
+    if choice == "1":
+        gi = repo / ".gitignore"
+        existing = gi.read_text(encoding="utf-8", errors="ignore").splitlines() if gi.exists() else []
+        added = []
+        for rel, _ in big:
+            if rel not in existing:
+                added.append(rel)
+        if added:
+            with gi.open("a", encoding="utf-8") as f:
+                if existing and not existing[-1].endswith(""):
+                    f.write("\n")
+                for rel in added:
+                    f.write(rel + "\n")
+            print(f"[+] Added {len(added)} path(s) to .gitignore")
+        else:
+            print(f"[i] All files already in .gitignore")
+        # Untrack any that are already tracked
+        for rel, _ in big:
+            subprocess.run(
+                ["git", "-C", str(repo), "rm", "--cached", "-r", "--", rel],
+                capture_output=True,
+            )
+        return False  # user chose to skip, do not push
+    if choice == "2":
+        if not _has_lfs():
+            print("[!] `git lfs` is not installed.")
+            print("    Install: winget install GitHub.LFS  (or  choco install git-lfs)")
+            print("    Or download: https://git-lfs.github.com")
+            return False
+        # Derive patterns from extensions of the large files
+        exts = sorted({Path(rel).suffix for rel, _ in big if Path(rel).suffix})
+        patterns = [f"*{ext}" for ext in exts] if exts else []
+        if not patterns:
+            patterns = [Path(big[0][0]).name]
+        if not _lfs_install(repo, patterns):
+            print("[!] LFS setup failed.")
+            return False
+        # Untrack and re-add under LFS
+        for rel, _ in big:
+            subprocess.run(
+                ["git", "-C", str(repo), "rm", "--cached", "-r", "--", rel],
+                capture_output=True,
+            )
+        # The next `git add` (in cmd_push) will pick them up via LFS
+        return True
+    if choice == "3":
+        return True
+    print("[i] Aborted.")
+    return False
+
+
 def cmd_push(repo: Path, msg: str):
     """Git add + commit + push."""
     _ensure_lf_preserved(repo)
     if not _has_global_git_identity():
         _prompt_git_identity()
+    big = _list_large_files(repo, 100)
+    if big:
+        if not _handle_large_files(repo, big):
+            return
     result = subprocess.run(
         ["git", "-C", str(repo), "status", "--porcelain"],
         capture_output=True, text=True
@@ -228,7 +447,15 @@ def cmd_push(repo: Path, msg: str):
 
     if not result:
         print("[+] Nothing to commit.")
-        return
+        ans = input("    Force empty commit + push? [y/N] ").strip().lower()
+        if ans != "y":
+            print("[i] Skipped.")
+            return
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "--allow-empty", "-m", msg],
+            check=True, capture_output=True,
+        )
+        return _push_only(repo)
 
     print(f"[+] Committing in {repo.name}...")
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True, capture_output=True)
@@ -264,27 +491,7 @@ def cmd_push(repo: Path, msg: str):
             print(f"[!] Commit failed:\n{stderr}")
             return
 
-    print(f"[+] Pushing to remote...")
-    push = subprocess.run(
-        ["git", "-C", str(repo), "push"],
-        capture_output=True, text=True
-    )
-    if push.returncode != 0 and "no upstream branch" in push.stderr:
-        branch = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True, text=True,
-        ).stdout.strip() or "master"
-        print(f"[i] Setting upstream to origin/{branch}...")
-        push = subprocess.run(
-            ["git", "-C", str(repo), "push", "--set-upstream", "origin", branch],
-            capture_output=True, text=True,
-        )
-    if push.returncode != 0:
-        print(f"[!] Push failed (exit {push.returncode}):\n{push.stderr.strip()}")
-        return
-
-    web_url = _get_remote_url(repo)
-    print(f"[+] Done." + (f"  {web_url}" if web_url else ""))
+    _push_only(repo)
 
 
 def cmd_new(repo_name: str, private: bool = True, push_local: bool = False):
@@ -594,6 +801,113 @@ def _confirm_repo(repo: Path) -> bool | Path | None:
         print("Invalid. Type Y, n, s, or ?.")
 
 
+def cmd_wipe_remote(repo: Path) -> None:
+    """Destructive: replace remote history with a single empty commit.
+    Keeps the repo, URL, stars, watches. All branches except default become orphans
+    that need manual deletion."""
+    import tempfile, shutil
+    token = get_token()
+    if not token:
+        return
+    remote_url = _get_remote_url(repo)
+    if not remote_url:
+        print("[!] No remote URL configured.")
+        return
+    owner, name = _parse_owner_repo(remote_url)
+    if not owner or not name:
+        print(f"[!] Cannot parse owner/repo from remote URL: {remote_url}")
+        return
+
+    # Confirm twice — this is irreversible on the server side.
+    print(f"[!] This will REPLACE all commits on GitHub with a single empty commit.")
+    print(f"    Target: https://github.com/{owner}/{name}")
+    if input("    Continue? [y/N] ").strip().lower() != "y":
+        print("[i] Aborted.")
+        return
+    if input(f"    Type the repo name '{name}' to confirm: ").strip() != name:
+        print("[i] Aborted.")
+        return
+
+    default_branch = _get_default_branch(owner, name, token) or "main"
+
+    # Build an orphan branch in a temp clone, then force-push it to the default.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp) / name
+        print(f"[+] Cloning to {tmp_path}...")
+        rc, out = _run_streaming(
+            ["git", "clone", remote_url, str(tmp_path)],
+        )
+        if rc != 0:
+            print("[!] Clone failed.")
+            return
+        # Make this checkout the orphan branch
+        subprocess.run(
+            ["git", "-C", str(tmp_path), "checkout", "--orphan", "tmp_wipe"],
+            check=True, capture_output=True,
+        )
+        # Remove all tracked files
+        subprocess.run(
+            ["git", "-C", str(tmp_path), "rm", "-rf", "."],
+            capture_output=True,  # OK if there are no files
+        )
+        # Commit the empty tree
+        subprocess.run(
+            ["git", "-C", str(tmp_path), "commit", "--allow-empty",
+             "-m", "wipe: replace history with empty commit"],
+            check=True, capture_output=True,
+        )
+        # Force-push the orphan branch to the default
+        print(f"[+] Force-pushing orphan to {default_branch}...")
+        rc, out = _run_streaming(
+            ["git", "-C", str(tmp_path), "push", "origin",
+             "tmp_wipe:" + default_branch, "--force"],
+        )
+        if rc != 0:
+            print("[!] Force-push failed.")
+            return
+        # Delete the orphan branch on remote
+        subprocess.run(
+            ["git", "-C", str(tmp_path), "push", "origin", "--delete", "tmp_wipe"],
+            capture_output=True,
+        )
+        # Also delete any other branches the server still has
+        ls = subprocess.run(
+            ["git", "-C", str(tmp_path), "ls-remote", "--heads", "origin"],
+            capture_output=True, text=True,
+        )
+        for line in ls.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 2 or not parts[1].startswith("refs/heads/"):
+                continue
+            br = parts[1].removeprefix("refs/heads/")
+            if br != default_branch:
+                subprocess.run(
+                    ["git", "-C", str(tmp_path), "push", "origin", "--delete", br],
+                    capture_output=True,
+                )
+                print(f"    - deleted remote branch: {br}")
+
+    print(f"[+] Done. https://github.com/{owner}/{name} now has a single empty commit on {default_branch}.")
+
+
+def _get_default_branch(owner: str, name: str, token: str) -> str | None:
+    try:
+        data = http_get(f"{GITHUB_API}/repos/{owner}/{name}", token)
+        return json.loads(data).get("default_branch")
+    except Exception:
+        return None
+
+
+def _parse_owner_repo(remote_url: str) -> tuple[str | None, str | None]:
+    """Extract (owner, repo) from a GitHub remote URL.
+    Supports https://github.com/owner/repo[.git] and git@github.com:owner/repo[.git]."""
+    import re
+    m = re.search(r"github\.com[:/]([^/]+)/([^/.]+?)(?:\.git)?/?$", remote_url)
+    if m:
+        return m.group(1), m.group(2)
+    return None, None
+
+
 def interactive():
     """Confirm repo -> action menu."""
     repo = find_repo_root(Path.cwd())
@@ -655,9 +969,10 @@ def interactive():
         ("Pull", "pull", "Fetch and merge latest changes from remote"),
         ("Status", "status", "Show uncommitted changes and remote state"),
         ("Switch repo", "switch", "Pick a different git repo to work with"),
+        ("Wipe remote history", "wipe", "Destructive: replace all GitHub history with a single empty commit"),
     ]
     choice = show_menu(choices, header)
-    action = ["push", "pull", "status", "switch"][choice - 1]
+    action = ["push", "pull", "status", "switch", "wipe"][choice - 1]
 
     if action == "switch":
         repo = _pick_repo()
@@ -675,12 +990,17 @@ def interactive():
             ("Pull", "pull", "Fetch and merge latest changes from remote"),
             ("Status", "status", "Show uncommitted changes and remote state"),
             ("Switch repo", "switch", "Pick a different git repo to work with"),
+            ("Wipe remote history", "wipe", "Destructive: replace all GitHub history with a single empty commit"),
         ]
         choice = show_menu(choices, header)
-        action = ["push", "pull", "status", "switch"][choice - 1]
+        action = ["push", "pull", "status", "switch", "wipe"][choice - 1]
 
     if action == "status":
         cmd_status(repo)
+        return
+
+    if action == "wipe":
+        cmd_wipe_remote(repo)
         return
 
     if action in ("push", "pull"):
@@ -695,7 +1015,7 @@ def interactive():
 
 def main():
     parser = argparse.ArgumentParser(description="GitHub CLI: push, pull, new, init.")
-    parser.add_argument("command", nargs="?", help="push, pull, new, init, status")
+    parser.add_argument("command", nargs="?", help="push, pull, new, init, status, wipe")
     parser.add_argument("arg", nargs="?", help="repo name or commit message")
     parser.add_argument("-p", "--private", action="store_true", default=True,
                         help="make repo private (default: True)")
@@ -747,9 +1067,16 @@ def main():
             sys.exit(1)
         cmd_init(args.arg, args.private, args.push_local)
 
+    elif cmd == "wipe":
+        repo = find_repo_root(Path.cwd())
+        if not repo:
+            print("[!] Not in a git repository.")
+            sys.exit(1)
+        cmd_wipe_remote(repo)
+
     else:
         print(f"[!] Unknown command: {cmd}")
-        print("    Available: push, pull, new, init, status")
+        print("    Available: push, pull, new, init, status, wipe")
         print("    Or run 'gh' for interactive menu.")
 
 
