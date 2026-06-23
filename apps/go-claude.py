@@ -104,6 +104,7 @@ PRICING = {
 }
 
 USD_TWD = 31.5
+USD_CNY = 7.25
 
 # ============================================================
 # Path helpers
@@ -436,6 +437,24 @@ def show_status() -> None:
 # Cost calculation
 # ============================================================
 
+def _newest_session_log() -> str | None:
+    """Find the most recently written JSONL session log under ~/.claude/projects/."""
+    base = projects_dir()
+    if not base.exists():
+        return None
+    best: tuple[float, str] = (0.0, "")
+    try:
+        for p in base.rglob("*.jsonl"):
+            try:
+                mtime = p.stat().st_mtime
+                if mtime > best[0]:
+                    best = (mtime, str(p))
+            except OSError:
+                continue
+    except OSError:
+        return None
+    return best[1] or None
+
 def _resolve_pricing(provider: str | None, model: str | None) -> tuple[str, str, dict]:
     if not provider or not model:
         mid = os.environ.get("ANTHROPIC_MODEL") or ""
@@ -460,7 +479,7 @@ def _resolve_pricing(provider: str | None, model: str | None) -> tuple[str, str,
         p = PRICING["deepseek:flash"]
     return provider, model, p
 
-def cost(inp: int, out: int, cr: int, cw: int, provider: str | None = None, model: str | None = None, no_twd: bool = False) -> None:
+def cost(inp: int, out: int, cr: int, cw: int, provider: str | None = None, model: str | None = None, no_twd: bool = False, no_cny: bool = False) -> None:
     provider, model, p = _resolve_pricing(provider, model)
     ic = (inp  / 1_000_000) * p["input"]
     oc = (out / 1_000_000) * p["output"]
@@ -480,9 +499,11 @@ def cost(inp: int, out: int, cr: int, cw: int, provider: str | None = None, mode
     ok(f"TOTAL:  $ {total:.6f}")
     if not no_twd:
         ok(f"TOTAL:  NT$ {total * USD_TWD:.4f}  (USD/TWD = {USD_TWD})")
+    if not no_cny:
+        ok(f"TOTAL:  ¥ {total * USD_CNY:.4f}  (USD/CNY = {USD_CNY})")
     print()
 
-def cost_from_log(path: str | None = None, cwd: str | None = None) -> None:
+def cost_from_log(path: str | None = None, cwd: str | None = None, no_twd: bool = False, no_cny: bool = False) -> None:
     target = path
     if not target:
         base = projects_dir()
@@ -521,7 +542,27 @@ def cost_from_log(path: str | None = None, cwd: str | None = None) -> None:
     print()
     warn(f"session : {Path(target).stem}  ({n} assistant turns)")
     warn(f"file    : {target}")
-    cost(in_t, out_t, cr_t, cw_t)
+    cost(in_t, out_t, cr_t, cw_t, no_twd=no_twd, no_cny=no_cny)
+
+def auto_cost_from_log() -> None:
+    """Auto-display token & cost summary from the newest session log.
+
+    Called automatically after `claude` exits.  Silently skips when
+    there is no session log (first run / no assistant turns).
+    """
+    target = _newest_session_log()
+    if not target:
+        return
+    # Only show if the log was written within the last 30 seconds
+    # (i.e. by the session that just ended, not some old one).
+    try:
+        mtime = Path(target).stat().st_mtime
+        now = __import__("time").time()
+        if now - mtime > 30:
+            return
+    except OSError:
+        return
+    cost_from_log(path=target)
 
 # ============================================================
 # Interactive menu
@@ -585,7 +626,7 @@ def _print_siblings(current: Path | None = None) -> None:
         marker = "  <- newest" if p == sibs[0] else ""
         print(f"  {p.name}{marker}")
 
-def _launch_claude(extra_argv: list[str]) -> int:
+def _launch_claude(extra_argv: list[str], no_cost: bool = False) -> int:
     """Run the `claude` CLI with the env we just set; fall back gracefully if missing."""
     here = Path(__file__).resolve().parent
     sysname = platform.system()
@@ -620,7 +661,7 @@ def _launch_claude(extra_argv: list[str]) -> int:
     info(f"$ {' '.join(cmd)}")
     print()
     try:
-        return subprocess.call(cmd)
+        rc = subprocess.call(cmd)
     except FileNotFoundError:
         err(f"failed to exec: {cmd[0]}")
         return 127
@@ -628,8 +669,18 @@ def _launch_claude(extra_argv: list[str]) -> int:
         print()
         return 130
 
-def run_claude(provider: str | None, model: str | None, extra_argv: list[str]) -> int:
+    # Show cost summary after Claude exits (unless opted out)
+    if not no_cost and not os.environ.get("CLAUDE_GO_NO_COST"):
+        auto_cost_from_log()
+
+    return rc
+
+def run_claude(provider: str | None, model: str | None, extra_argv: list[str], no_cost: bool = False) -> int:
     """Menu / preset / reset → set model (if any) → launch claude."""
+    # Merge CLAUDE_GO_NO_COST env var
+    if os.environ.get("CLAUDE_GO_NO_COST"):
+        no_cost = True
+
     if provider == "__menu__":
         pick = menu_pick()
         if pick is None:
@@ -647,7 +698,7 @@ def run_claude(provider: str | None, model: str | None, extra_argv: list[str]) -
     if not set_model(provider, model):
         return 1
 
-    return _launch_claude(extra_argv)
+    return _launch_claude(extra_argv, no_cost=no_cost)
 
 # ============================================================
 # Run claude
@@ -902,9 +953,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = p.add_subparsers(dest="cmd")
 
-    sub.add_parser("flash",      help="deepseek flash + menu + launch claude")
-    sub.add_parser("pro",        help="deepseek pro + menu + launch claude")
-    sub.add_parser("menu",       help="interactive picker + launch claude")
+    # All subcommands that launch claude get --no-cost
+    def add_no_cost(sp):
+        sp.add_argument("--no-cost", action="store_true",
+                        help="skip auto cost display after Claude exits")
+
+    add_no_cost(sub.add_parser("flash",      help="deepseek flash + menu + launch claude"))
+    add_no_cost(sub.add_parser("pro",        help="deepseek pro + menu + launch claude"))
+    add_no_cost(sub.add_parser("menu",       help="interactive picker + launch claude"))
     sub.add_parser("status",     help="show current provider / env")
     sub.add_parser("reset",      help="clear all provider env (back to Anthropic default)")
     sub.add_parser("prereq",     help="check prereqs (settings dir + claude CLI)")
@@ -912,13 +968,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_or = sub.add_parser("or",        help="openrouter: python claude-go.py or [model]")
     p_or.add_argument("model", nargs="?", default="sonnet")
+    add_no_cost(p_or)
 
     p_an = sub.add_parser("anthropic", help="anthropic: python claude-go.py anthropic [model]")
     p_an.add_argument("model", nargs="?", default="sonnet")
+    add_no_cost(p_an)
 
     p_custom = sub.add_parser("use",     help="python claude-go.py use <provider> <model>")
     p_custom.add_argument("provider")
     p_custom.add_argument("model")
+    add_no_cost(p_custom)
 
     p_key = sub.add_parser("key",      help="set provider API key: python claude-go.py key <provider> <key>")
     p_key.add_argument("provider")
@@ -935,10 +994,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_cost.add_argument("-p", "--provider")
     p_cost.add_argument("-m", "--model")
     p_cost.add_argument("--no-twd", action="store_true")
+    p_cost.add_argument("--no-cny", action="store_true")
 
     p_log = sub.add_parser("cost-log", help="compute cost from the most recent session log")
     p_log.add_argument("--cwd", help="project cwd to match (default: any)")
     p_log.add_argument("--path", help="explicit log path")
+    p_log.add_argument("--no-twd", action="store_true")
+    p_log.add_argument("--no-cny", action="store_true")
 
     sub.add_parser("models",     help="alias for list")
 
@@ -960,18 +1022,23 @@ def main(argv: list[str] | None = None) -> int:
 
     cmd = args.cmd
 
+    # Helper: extract --no-cost flag from parsed args (present on launch subcommands)
+    no_cost = getattr(args, "no_cost", False)
+    no_twd  = getattr(args, "no_twd",  False)
+    no_cny  = getattr(args, "no_cny",  False)
+
     if cmd == "flash":
-        return run_claude("deepseek", "flash", [])
+        return run_claude("deepseek", "flash", [], no_cost=no_cost)
     if cmd == "pro":
-        return run_claude("deepseek", "pro", [])
+        return run_claude("deepseek", "pro", [], no_cost=no_cost)
     if cmd == "or":
-        return run_claude("openrouter", args.model, [])
+        return run_claude("openrouter", args.model, [], no_cost=no_cost)
     if cmd == "anthropic":
-        return run_claude("anthropic", args.model, [])
+        return run_claude("anthropic", args.model, [], no_cost=no_cost)
     if cmd == "use":
-        return run_claude(args.provider, args.model, [])
+        return run_claude(args.provider, args.model, [], no_cost=no_cost)
     if cmd == "menu":
-        return run_claude("__menu__", None, [])
+        return run_claude("__menu__", None, [], no_cost=no_cost)
     if cmd == "status":
         show_status()
         return 0
@@ -1003,10 +1070,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if cmd == "cost":
         cost(args.input, args.output, args.cache_read, args.cache_write,
-             provider=args.provider, model=args.model, no_twd=args.no_twd)
+             provider=args.provider, model=args.model,
+             no_twd=args.no_twd, no_cny=args.no_cny)
         return 0
     if cmd == "cost-log":
-        cost_from_log(path=args.path, cwd=args.cwd)
+        cost_from_log(path=args.path, cwd=args.cwd, no_twd=args.no_twd, no_cny=args.no_cny)
         return 0
 
     parser.print_help()

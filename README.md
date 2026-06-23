@@ -12,7 +12,8 @@ devtool/                 <- GitHub repo (source of truth)
 ├── deploy-linux.sh      <- Linux installer
 └── apps/                <- Your actual tools (installed to ~/devtool/apps/)
     ├── go-claude.py
-    └── go-github.py     <- GitHub: push, pull, new, init
+    ├── go-github.py      <- GitHub: push, pull, new, init
+    └── go-rclone.py      <- Google Drive: upload, download, sync, list, browse
 ```
 
 ## Workflow
@@ -36,6 +37,17 @@ go-github init myrepo <- Create repo + git init + first push
 
 # Pull latest on another machine
 .\deploy-win.ps1
+```
+
+**Google Drive (rclone):**
+```powershell
+go-rclone                        # Interactive menu
+go-rclone setup                  # One-time: install rclone + authorize Google
+go-rclone upload  .\photos gdrive:backup/photos   # copy local -> Drive
+go-rclone download gdrive:docs .  # copy Drive -> local
+go-rclone sync    .\notes gdrive:notes            # mirror (destructive)
+go-rclone list    gdrive:backup                   # list Drive contents
+go-rclone browse                                  # pick a path interactively
 ```
 
 ## Files explained
