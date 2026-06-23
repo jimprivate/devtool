@@ -18,6 +18,7 @@ Optional subcommands (all pick-from-menu too — these just preset the provider)
     python claude-go.py cost 100 50    # cost from tokens
     python claude-go.py key deepseek sk-...  # set API key
     python claude-go.py reset          # clear provider env
+    python claude-go.py balance        # show DeepSeek account balance
 
 One-time setup (Windows PowerShell):
 
@@ -432,6 +433,51 @@ def show_status() -> None:
         shown = "***set***" if v else "<not set>"
         print(f"  {ep['api_key_env']:<30} {shown}  [{k}]")
     print()
+    show_balance("deepseek")
+
+# ============================================================
+# Balance
+# ============================================================
+
+def fetch_balance(provider: str = "deepseek") -> dict | None:
+    """Call GET /user/balance for the official DeepSeek API. Returns parsed JSON or None."""
+    api_key = get_provider_key(provider)
+    if not api_key:
+        return None
+    if provider != "deepseek":
+        return None
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://api.deepseek.com/user/balance",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        warn(f"could not fetch balance: {e}")
+        return None
+
+def show_balance(provider: str = "deepseek") -> None:
+    result = fetch_balance(provider)
+    print()
+    if result is None:
+        warn(f"could not fetch balance for {provider} (no key or network error)")
+        return
+    info(f"balance for {provider}:")
+    avail = "yes" if result.get("is_available") else color("NO", C.RED)
+    print(f"  available : {avail}")
+    for bi in result.get("balance_infos", []):
+        sym = bi.get("currency", "?")
+        total = float(bi.get("total_balance", 0))
+        granted = float(bi.get("granted_balance", 0))
+        topped = float(bi.get("topped_up_balance", 0))
+        note = "  (CNY, ¥)" if sym == "CNY" else ""
+        print(f"  {sym:<5} total={total:.4f}  (topped={topped:.4f}  granted={granted:.4f}){note}")
+    print()
 
 # ============================================================
 # Cost calculation
@@ -479,7 +525,10 @@ def _resolve_pricing(provider: str | None, model: str | None) -> tuple[str, str,
         p = PRICING["deepseek:flash"]
     return provider, model, p
 
-def cost(inp: int, out: int, cr: int, cw: int, provider: str | None = None, model: str | None = None, no_twd: bool = False, no_cny: bool = False) -> None:
+def cost(inp: int, out: int, cr: int, cw: int,
+         provider: str | None = None, model: str | None = None,
+         no_twd: bool = False, no_cny: bool = False,
+         cache_hits: int = 0) -> None:
     provider, model, p = _resolve_pricing(provider, model)
     ic = (inp  / 1_000_000) * p["input"]
     oc = (out / 1_000_000) * p["output"]
@@ -490,6 +539,7 @@ def cost(inp: int, out: int, cr: int, cw: int, provider: str | None = None, mode
     info(f"provider/model : {provider} / {model}")
     info(f"resolved       : {os.environ.get('ANTHROPIC_MODEL', '')}")
     print(f"tokens: in={inp:,}  out={out:,}  cache_read={cr:,}  cache_write={cw:,}")
+    print(f"cache  : hits={cache_hits:,}  read={cr:,}  write={cw:,}")
     warn("cost breakdown:")
     print(f"  input         {ic:.6f}")
     print(f"  output        {oc:.6f}")
@@ -522,6 +572,7 @@ def cost_from_log(path: str | None = None, cwd: str | None = None, no_twd: bool 
         warn("no session log found")
         return
     in_t = out_t = cr_t = cw_t = 0
+    cache_hits = 0
     n = 0
     for line in Path(target).read_text(encoding="utf-8", errors="ignore").splitlines():
         s = line.strip()
@@ -538,11 +589,15 @@ def cost_from_log(path: str | None = None, cwd: str | None = None, no_twd: bool 
         out_t += int(u.get("output_tokens") or 0)
         cr_t  += int(u.get("cache_read_input_tokens")     or 0)
         cw_t  += int(u.get("cache_creation_input_tokens") or 0)
+        if int(u.get("cache_read_input_tokens") or 0) > 0:
+            cache_hits += 1
         n += 1
     print()
     warn(f"session : {Path(target).stem}  ({n} assistant turns)")
     warn(f"file    : {target}")
-    cost(in_t, out_t, cr_t, cw_t, no_twd=no_twd, no_cny=no_cny)
+    cost(in_t, out_t, cr_t, cw_t,
+         no_twd=no_twd, no_cny=no_cny,
+         cache_hits=cache_hits)
 
 def auto_cost_from_log() -> None:
     """Auto-display token & cost summary from the newest session log.
@@ -1004,6 +1059,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("models",     help="alias for list")
 
+    p_bal = sub.add_parser("balance",  help="show DeepSeek account balance")
+    p_bal.add_argument("provider", nargs="?", default="deepseek")
+
     return p
 
 # ============================================================
@@ -1012,6 +1070,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
+
+    # Fix stdout encoding on Windows so symbols (¥, $, etc.) render correctly in PowerShell.
+    if platform.system() == "Windows":
+        try:
+            import io
+            sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
     # No args: go straight to menu + launch. No bootstrap, no shell detection.
     if not argv:
@@ -1071,10 +1137,14 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "cost":
         cost(args.input, args.output, args.cache_read, args.cache_write,
              provider=args.provider, model=args.model,
-             no_twd=args.no_twd, no_cny=args.no_cny)
+             no_twd=args.no_twd, no_cny=args.no_cny,
+             cache_hits=0)
         return 0
     if cmd == "cost-log":
         cost_from_log(path=args.path, cwd=args.cwd, no_twd=args.no_twd, no_cny=args.no_cny)
+        return 0
+    if cmd == "balance":
+        show_balance(args.provider)
         return 0
 
     parser.print_help()
