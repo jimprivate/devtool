@@ -1,0 +1,2 @@
+#!/bin/sh
+exec python3 "/Users/jm2pro/devtool/apps/go-claude.py" "$@"

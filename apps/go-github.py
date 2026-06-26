@@ -25,33 +25,175 @@ def _config_dir():
     return base / "go-github"
 
 
-def _token_file():
-    return _config_dir() / "token"
+# Global token cache — set once per session by use_account()
+_cached_token: str | None = None
+_cached_username: str | None = None
 
 
-def get_token():
-    """Read token from disk, prompt and cache if missing."""
-    tf = _token_file()
-    if tf.exists():
-        token = tf.read_text().strip()
+def use_account(token: str, username: str):
+    """Store the selected account so subsequent calls reuse it without re-picking."""
+    global _cached_token, _cached_username
+    _cached_token = token
+    _cached_username = username
+
+
+def _accounts_file():
+    return _config_dir() / "accounts.json"
+
+
+def _current_file():
+    return _config_dir() / "current"
+
+
+def _migrate_token():
+    """Move legacy token file to accounts.json."""
+    old = _config_dir() / "token"
+    if old.exists() and not _accounts_file().exists():
+        token = old.read_text().strip()
         if token:
-            return token
+            # Validate token and get username
+            try:
+                data = http_get(f"{GITHUB_API}/user", token)
+                username = json.loads(data)["login"]
+                accounts = {username: {"token": token}}
+                _accounts_file().write_text(json.dumps(accounts, indent=2))
+                _current_file().write_text(username)
+                old.unlink()
+                return username
+            except Exception:
+                pass
+    return None
 
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
-    if token:
-        return token
 
-    token = input("GitHub token: ").strip()
-    if not token:
-        print("[!] Token required. Get one at: https://github.com/settings/tokens (scope: repo)")
-        sys.exit(1)
+def _list_accounts():
+    f = _accounts_file()
+    if not f.exists():
+        return {}
+    return json.loads(f.read_text())
 
-    tf.parent.mkdir(parents=True, exist_ok=True)
-    tf.write_text(token)
-    tf.chmod(0o600)
-    print(f"[+] Token saved to {tf}")
-    os.environ["GITHUB_TOKEN"] = token
-    return token
+
+def _save_accounts(accounts):
+    _config_dir().mkdir(parents=True, exist_ok=True)
+    _accounts_file().write_text(json.dumps(accounts, indent=2))
+
+
+def _current_username():
+    cur = _current_file()
+    if cur.exists():
+        return cur.read_text().strip()
+    accounts = _list_accounts()
+    if accounts:
+        return next(iter(accounts))
+
+
+def _add_account(token: str) -> str | None:
+    """Save token, return username on success, None on failure."""
+    try:
+        data = http_get(f"{GITHUB_API}/user", token)
+        username = json.loads(data)["login"]
+        accounts = _list_accounts()
+        accounts[username] = {"token": token}
+        _save_accounts(accounts)
+        _current_file().write_text(username)
+        return username
+    except Exception as e:
+        print(f"[!] Token invalid: {e}")
+        return None
+
+
+def _remove_account(username: str):
+    accounts = _list_accounts()
+    if username in accounts:
+        del accounts[username]
+        _save_accounts(accounts)
+        cur = _current_username()
+        if cur == username:
+            remaining = list(accounts.keys())
+            _current_file().write_text(remaining[0] if remaining else "")
+
+
+def get_account() -> tuple[str, str]:
+    """
+    Return (token, username) for the active GitHub account.
+    Always shows a picker — even with a single account.
+    """
+    global _cached_token, _cached_username
+    if _cached_token and _cached_username:
+        return _cached_token, _cached_username
+
+    # Migrate legacy token file first time
+    if not _accounts_file().exists():
+        migrated = _migrate_token()
+        if migrated:
+            print(f"[+] Migrated legacy token for @{migrated}")
+
+    accounts = _list_accounts()
+    cur = _current_username()
+
+    # Always show picker
+    while True:
+        print()
+        print("[ GitHub Account ]")
+        if cur and cur in accounts:
+            print(f"  Current: @{cur}")
+        if accounts:
+            for i, name in enumerate(accounts, 1):
+                marker = " [active]" if name == cur else ""
+                masked = accounts[name]["token"][:4] + "****" + accounts[name]["token"][-4:]
+                print(f"  {i}. {name}  ({masked}){marker}")
+        print(f"  +. Add new account")
+        if accounts and len(accounts) > 1:
+            print(f"  -. Remove an account")
+        print(f"  0. Exit")
+
+        choice = input("Select account: ").strip()
+        if choice == "0":
+            sys.exit(0)
+
+        if choice == "+":
+            token = input("  GitHub token: ").strip()
+            if not token:
+                print("  Required.")
+                continue
+            username = _add_account(token)
+            if username:
+                print(f"[+] Account @{username} saved.")
+                accounts = _list_accounts()
+                _cached_token = accounts[username]["token"]
+                _cached_username = username
+                return _cached_token, _cached_username
+            continue
+
+        if choice == "-" and accounts and len(accounts) > 1:
+            print("  Which account to remove?")
+            for i, name in enumerate(accounts, 1):
+                print(f"    {i}. {name}")
+            target = input("Account to remove: ").strip()
+            try:
+                idx = int(target) - 1
+                target_name = list(accounts.keys())[idx]
+            except (ValueError, IndexError):
+                target_name = target
+            if target_name in accounts:
+                _remove_account(target_name)
+                accounts = _list_accounts()
+                cur = _current_username()
+                if not accounts:
+                    print("  No accounts left. Add one first.")
+                continue
+            continue
+
+        try:
+            idx = int(choice) - 1
+            name = list(accounts.keys())[idx]
+            _current_file().write_text(name)
+            _cached_token = accounts[name]["token"]
+            _cached_username = name
+            return _cached_token, _cached_username
+        except (ValueError, IndexError):
+            pass
+
+        print("Invalid.")
 
 
 class HttpError(Exception):
@@ -112,6 +254,12 @@ def find_repo_root(start: Path) -> Path | None:
     while p != p.parent:
         if (p / ".git").exists():
             return p
+        # Also check sibling directories (e.g. ~/Downloads/devtool-master 2/ next to ~/devtool/)
+        for sibling in p.parent.iterdir():
+            if sibling == p:
+                continue
+            if sibling.is_dir() and (sibling / ".git").exists():
+                return sibling
         p = p.parent
     return None
 
@@ -458,11 +606,7 @@ def _has_remote(repo: Path) -> bool:
 def _prompt_set_remote(repo: Path) -> bool:
     """Offer to set origin to a GitHub repo from the user's account.
     Returns True if origin was set (or already correct), False if user aborted."""
-    token = get_token()
-    if not token:
-        return False
-    user_data = http_get(f"{GITHUB_API}/user", token)
-    username = json.loads(user_data)["login"]
+    token, username = get_account()
 
     print()
     warn(f"No remote configured for {repo.name}.")
@@ -764,10 +908,7 @@ def cmd_push(repo: Path, msg: str):
 
 def cmd_new(repo_name: str, private: bool = True, push_local: bool = False):
     """Create a GitHub repo. Optionally push local files from current dir."""
-    token = get_token()
-    user_url = f"{GITHUB_API}/user"
-    user_data = http_get(user_url, token)
-    username = json.loads(user_data)["login"]
+    token, username = get_account()
 
     create_url = f"{GITHUB_API}/user/repos"
     data = {
@@ -807,10 +948,7 @@ def cmd_new(repo_name: str, private: bool = True, push_local: bool = False):
 
 def cmd_init(repo_name: str, private: bool = True, push_local: bool = True):
     """Create GitHub repo, git init, first commit + push."""
-    token = get_token()
-    user_url = f"{GITHUB_API}/user"
-    user_data = http_get(user_url, token)
-    username = json.loads(user_data)["login"]
+    token, username = get_account()
 
     # Create GitHub repo
     create_url = f"{GITHUB_API}/user/repos"
@@ -1036,9 +1174,7 @@ def _pick_github_repo(visibility: str = "private",
                       allow_delete: bool = True) -> str | None:
     """Picker that shows the user's GitHub repos (paginated). Returns 'owner/name' or None.
     Pass allow_delete=False to hide the 'D' delete option."""
-    token = get_token()
-    me_data = http_get(f"{GITHUB_API}/user", token)
-    me = json.loads(me_data)["login"]
+    token, me = get_account()
 
     repos = _list_github_repos(token, affiliation=affiliation, visibility=visibility)
     if not repos:
@@ -1136,9 +1272,7 @@ def cmd_wipe_remote(repo: Path) -> None:
     Keeps the repo, URL, stars, watches. All branches except default become orphans
     that need manual deletion."""
     import tempfile, shutil
-    token = get_token()
-    if not token:
-        return
+    token, _ = get_account()
     remote_url = _get_remote_url(repo)
     if not remote_url:
         print("[!] No remote URL configured.")
@@ -1230,9 +1364,7 @@ def _get_default_branch(owner: str, name: str, token: str) -> str | None:
 
 def cmd_list(visibility: str = "all", affiliation: str = "owner,collaborator,organization_member"):
     """List all GitHub repos the token can see, with visibility + role."""
-    token = get_token()
-    me_data = http_get(f"{GITHUB_API}/user", token)
-    me = json.loads(me_data)["login"]
+    token, me = get_account()
 
     repos = _list_github_repos(token, affiliation=affiliation, visibility=visibility)
     if not repos:
@@ -1259,9 +1391,7 @@ def cmd_delete_picker(visibility: str = "all",
                        affiliation: str = "owner,collaborator,organization_member") -> None:
     """Pick a repo from a list, then hand off to cmd_delete. Loops so the user can
     delete several in one session."""
-    token = get_token()
-    me_data = http_get(f"{GITHUB_API}/user", token)
-    me = json.loads(me_data)["login"]
+    token, me = get_account()
 
     while True:
         repos = _list_github_repos(token, affiliation=affiliation, visibility=visibility)
@@ -1325,9 +1455,7 @@ def cmd_delete_picker(visibility: str = "all",
 
 def cmd_delete(target: str) -> None:
     """Permanently delete a GitHub repo. Two-step y/N confirmation."""
-    token = get_token()
-    me_data = http_get(f"{GITHUB_API}/user", token)
-    me = json.loads(me_data)["login"]
+    token, me = get_account()
 
     # Accept "name" or "owner/name"
     if "/" in target:
@@ -1397,6 +1525,10 @@ def _parse_owner_repo(remote_url: str) -> tuple[str | None, str | None]:
 
 def interactive():
     """Confirm repo -> action menu."""
+    # Always pick account first
+    token, username = get_account()
+    print()
+
     repo = find_repo_root(Path.cwd())
 
     if repo:
@@ -1405,23 +1537,84 @@ def interactive():
             print("Aborted.")
             return
     else:
-        print("[i] Not in a git repo -- picking one for you...")
-        picked = _pick_repo()
-        if picked is None:
-            print("[!] No git repos found.")
-            return
-        if picked == "__init__":
-            name = input("Repo name: ").strip()
-            if not name:
-                print("[!] Repo name required.")
+        print("[i] Not in a git repo — pick one to work with.")
+        print("  [L] Pick from local repos (scan ~/devtool siblings)")
+        print("  [G] Pick from GitHub repos (your account)")
+        sub = input("  Source [L/g]: ").strip().lower()
+        if sub == "g":
+            target = _pick_github_repo(visibility="all", allow_delete=False)
+            if not target:
                 return
-            priv = input("Private? [Y/n]: ").strip().lower() != "n"
-            cmd_init(name, priv)
-            return
-        repo = _resolve_and_confirm_recursive(picked)
-        if repo is None:
-            print("Aborted.")
-            return
+            owner, name = target.split("/", 1)
+            local = _find_local_clone_for(owner, name)
+            if local:
+                repo = _resolve_and_confirm_recursive(local)
+                if repo is None:
+                    return
+            else:
+                print(f"[i] No local clone of {target} found.")
+                print(f"  [C] Clone it to ~/devtool/{name}")
+                print(f"  [I] Init current dir ({Path.cwd().name}/) and push to {target}")
+                print(f"  [0] Cancel")
+                how = input("  Clone or init? [C/I/0]: ").strip().lower()
+                if how == "c":
+                    dest = Path.home() / name
+                    if dest.exists():
+                        print(f"[!] {dest} already exists.")
+                        return
+                    rc, _ = _run_streaming(["git", "clone", f"https://github.com/{target}.git", str(dest)])
+                    if rc == 0:
+                        repo = dest
+                    else:
+                        print("[!] Clone failed.")
+                        return
+                elif how == "i":
+                    here = Path.cwd()
+                    if (here / ".git").exists():
+                        print("[!] This directory is already a git repo.")
+                        return
+                    rc0, _ = _run_streaming(["git", "-C", str(here), "init"])
+                    if rc0 != 0:
+                        print("[!] git init failed.")
+                        return
+                    rc1, _ = _run_streaming(["git", "-C", str(here), "remote", "add", "origin", f"https://github.com/{target}.git"])
+                    if rc1 != 0:
+                        print("[!] git remote add failed.")
+                        return
+                    msg = input("  Commit message: ").strip() or "initial commit"
+                    rc2, _ = _run_streaming(["git", "-C", str(here), "add", "."])
+                    if rc2 != 0:
+                        print("[!] git add failed.")
+                        return
+                    rc3, _ = _run_streaming(["git", "-C", str(here), "commit", "-m", msg])
+                    if rc3 != 0:
+                        print("[!] git commit failed.")
+                        return
+                    rc4, _ = _run_streaming(["git", "-C", str(here), "push", "-u", "origin", "HEAD"])
+                    if rc4 != 0:
+                        print("[!] git push failed.")
+                        return
+                    print(f"[+] Pushed {here.name} to {target}")
+                    repo = here
+                else:
+                    return
+        else:
+            picked = _pick_repo()
+            if picked is None:
+                print("[!] No local git repos found.")
+                return
+            if picked == "__init__":
+                name = input("Repo name: ").strip()
+                if not name:
+                    print("[!] Repo name required.")
+                    return
+                priv = input("Private? [Y/n]: ").strip().lower() != "n"
+                cmd_init(name, priv)
+                return
+            repo = _resolve_and_confirm_recursive(picked)
+            if repo is None:
+                print("Aborted.")
+                return
 
     _action_menu(repo)
 

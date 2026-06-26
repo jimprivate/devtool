@@ -1,2 +1,2 @@
 @echo off
-py "%~dp0go-github.py" %*
+python3 "%~dp0go-github.py" %*

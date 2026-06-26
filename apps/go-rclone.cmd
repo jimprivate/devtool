@@ -1,2 +1,2 @@
 @echo off
-py "%~dp0go-rclone.py" %*
+python3 "%~dp0go-rclone.py" %*

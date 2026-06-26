@@ -6,7 +6,9 @@ No params, no launchers, no mess.
 
 import os
 import platform
+import re
 import shutil
+import ssl
 import subprocess
 import sys
 import urllib.request
@@ -46,46 +48,185 @@ def find_git():
     return shutil.which("git")
 
 
-def _prompt_git_identity():
-    """Ask user for git identity, save globally."""
-    git = find_git()
-    print()
-    print("    git needs your identity for commits.")
-    while True:
-        name = input("    Git user.name: ").strip()
-        if name:
-            break
-        print("    Required.")
-    while True:
-        email = input("    Git user.email (GitHub login email): ").strip()
-        if email:
-            break
-        print("    Required.")
+def _fix_mac_ssl():
+    """Run Install Certificates.command for Python on macOS if SSL is broken."""
+    import glob as _glob
+    for app in sorted(_glob.glob("/Applications/Python*/Install Certificates.command"), reverse=True):
+        print(f"    Running {app}...")
+        subprocess.run([app], capture_output=True, timeout=120)
 
-    subprocess.run([git, "config", "--global", "user.name", name], check=True)
-    subprocess.run([git, "config", "--global", "user.email", email], check=True)
-    print(f"    Saved to ~/.gitconfig.")
+
+def _check_ssl():
+    """Test SSL and offer to fix macOS certificate issue."""
+    if platform.system() != "Darwin":
+        return
+    try:
+        urllib.request.urlopen("https://api.github.com", timeout=10)
+    except ssl.SSLCertVerificationError:
+        print()
+        print("[!] SSL certificate error detected on macOS.")
+        print("    Python cannot verify HTTPS connections.")
+        while True:
+            print("    1. Auto-fix (run Install Certificates.command)")
+            print("    2. Skip for now")
+            c = input("    Select [1]: ").strip() or "1"
+            if c == "1":
+                _fix_mac_ssl()
+                # verify it worked
+                try:
+                    urllib.request.urlopen("https://api.github.com", timeout=10)
+                    print("    SSL fixed!")
+                    return
+                except Exception:
+                    print("    Still failing. Try manually:")
+                    print("    open /Applications/Python*/Install Certificates.command")
+                    return
+            elif c == "2":
+                return
+            print("Invalid.")
+
+
+# ── Git Identity ──────────────────────────────────────────────────────────────
+
+def _parse_gitconfig():
+    """Parse ~/.gitconfig and return all identity sections as list of dicts."""
+    cfg = Path.home() / ".gitconfig"
+    if not cfg.exists():
+        return []
+
+    identities = []
+    current = {"name": None, "email": None, "label": "(default)"}
+    content = cfg.read_text()
+
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[include]"):
+            # TODO: resolve path and recurse — skip for now
+            continue
+        m_include = re.match(r'\[user\s+"([^"]+)"\]', stripped)
+        if m_include:
+            if current["name"] or current["email"]:
+                identities.append(current)
+            current = {"name": None, "email": None, "label": m_include.group(1)}
+            continue
+        if stripped == "[user]":
+            if current["name"] or current["email"]:
+                identities.append(current)
+            current = {"name": None, "email": None, "label": "(default)"}
+            continue
+        if stripped.startswith("name"):
+            current["name"] = stripped.split("=", 1)[1].strip().strip('"')
+        elif stripped.startswith("email"):
+            current["email"] = stripped.split("=", 1)[1].strip().strip('"')
+
+    if current["name"] or current["email"]:
+        identities.append(current)
+
+    return identities
+
+
+def _add_git_identity(name, email, label=None):
+    """Save a new identity to ~/.gitconfig, optionally as a named section."""
+    git = find_git()
+    cfg_path = Path.home() / ".gitconfig"
+    content = cfg_path.read_text() if cfg_path.exists() else ""
+
+    if label:
+        section = f'[user "{label}"]\n'
+    else:
+        section = "[user]\n"
+
+    entry = f"{section}\tname = {name}\n\temail = {email}\n"
+    cfg_path.write_text(content + "\n" + entry)
+    return True
+
+
+def _set_devtool_identity(name, email):
+    """Apply identity to devtool repo's local git config (does not affect other repos)."""
+    git = find_git()
+    subprocess.run(
+        [git, "-C", str(DEVTOOL_DIR), "config", "user.name", name],
+        check=True, capture_output=True)
+    subprocess.run(
+        [git, "-C", str(DEVTOOL_DIR), "config", "user.email", email],
+        check=True, capture_output=True)
 
 
 def _check_git_identity():
-    """Ensure global git user.name and user.email are set. Prompt if missing."""
+    """
+    Show identity picker for this devtool repo.
+    Always asks, pre-selecting the currently active identity.
+    """
     git = find_git()
     if not git:
         return
 
-    name_r = subprocess.run([git, "config", "--global", "user.name"],
-                           capture_output=True, text=True)
-    email_r = subprocess.run([git, "config", "--global", "user.email"],
-                            capture_output=True, text=True)
+    identities = _parse_gitconfig()
 
-    name_ok = name_r.returncode == 0 and name_r.stdout.strip()
-    email_ok = email_r.returncode == 0 and email_r.stdout.strip()
+    # Get the currently active identity (local > global)
+    local_name = subprocess.run(
+        [git, "-C", str(DEVTOOL_DIR), "config", "user.name"],
+        capture_output=True, text=True).stdout.strip()
+    local_email = subprocess.run(
+        [git, "-C", str(DEVTOOL_DIR), "config", "user.email"],
+        capture_output=True, text=True).stdout.strip()
 
-    if name_ok and email_ok:
-        print(f"    git identity: {name_r.stdout.strip()} <{email_r.stdout.strip()}>")
-        return
+    if local_name and local_email:
+        active = f"{local_name} <{local_email}>"
+    else:
+        active = None
 
-    _prompt_git_identity()
+    while True:
+        print()
+        if active:
+            print(f"    Current: {active}")
+        if identities:
+            for i, ident in enumerate(identities, 1):
+                display = f"{ident['label']}: {ident['name']} <{ident['email']}>"
+                marker = " [current]" if display.startswith(active or "") else ""
+                print(f"    {i}. {display}{marker}")
+            print(f"    {len(identities) + 1}. Add new identity")
+        else:
+            print("    No identities found in ~/.gitconfig.")
+            print("    1. Add new identity")
+
+        default = "0"
+        choice = input(f"    Select identity [{default}]: ").strip() or default
+
+        if choice == "0":
+            if active:
+                print(f"    Keeping: {active}")
+                return
+            print("    Please select an identity.")
+            continue
+
+        try:
+            c = int(choice)
+        except ValueError:
+            print("    Invalid.")
+            continue
+
+        if identities and 1 <= c <= len(identities):
+            ident = identities[c - 1]
+            _set_devtool_identity(ident["name"], ident["email"])
+            print(f"    git identity: {ident['name']} <{ident['email']}>")
+            return
+        elif c == len(identities) + 1:
+            name = input("    Name: ").strip()
+            if not name:
+                print("    Required.")
+                continue
+            email = input("    Email: ").strip()
+            if not email:
+                print("    Required.")
+                continue
+            label = input("    Label (e.g. work, personal, leave blank for default): ").strip()
+            _add_git_identity(name, email, label or None)
+            _set_devtool_identity(name, email)
+            print(f"    git identity: {name} <{email}>")
+            return
+        else:
+            print("    Invalid.")
 
 
 def install_git():
@@ -228,22 +369,125 @@ def remove_from_path():
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 def _make_wrappers():
-    """Create .cmd launchers for each .py tool so they work as global commands."""
-    py = "py" if platform.system() == "Windows" else "python3"
+    """Create launchers so tools work as global commands on any platform."""
+    sysname = platform.system()
     for py_tool in sorted(APPS_DIR.glob("*.py")):
-        wrapper = py_tool.with_suffix(".cmd")
-        content = f'@echo off\n{py} "%~dp0{py_tool.name}" %*\n'
-        if wrapper.exists():
-            existing = wrapper.read_text(encoding="utf-8", errors="replace")
-            if existing == content:
-                continue
-        wrapper.write_text(content, encoding="utf-8")
-        print(f"    + {wrapper.name}")
+        # Always ensure .py is executable on Unix
+        if sysname != "Windows":
+            py_tool.chmod(0o755)
+
+        if sysname == "Windows":
+            wrapper = py_tool.with_suffix(".cmd")
+            content = f'@echo off\npython "%~dp0{py_tool.name}" %*\n'
+            if wrapper.exists():
+                existing = wrapper.read_text(encoding="utf-8", errors="replace")
+                if existing == content:
+                    continue
+            wrapper.write_text(content, encoding="utf-8")
+            print(f"    + {wrapper.name}")
+        else:
+            # Unix: create a shell wrapper (no extension) so `go-github` works directly
+            wrapper = py_tool.with_suffix("")
+            content = f"#!/bin/sh\nexec python3 \"$HOME/devtool/apps/{py_tool.name}\" \"$@\"\n"
+            if wrapper.exists():
+                existing = wrapper.read_text()
+                if existing == content:
+                    continue
+            wrapper.write_text(content)
+            wrapper.chmod(0o755)
+            print(f"    + {wrapper.name}")
+
+
+def _is_worktree_clean():
+    """Check if the git working tree is clean (no staged/unstaged changes)."""
+    git = find_git()
+    if not git:
+        return True
+    r = subprocess.run(
+        [git, "-C", str(DEVTOOL_DIR), "status", "--porcelain"],
+        capture_output=True, text=True)
+    return r.stdout.strip() == ""
+
+
+def _clean_worktree_for_pull():
+    """
+    Ensure the working tree is clean so a fast-forward pull can proceed.
+    Prompts user if there are local changes.
+    """
+    if _is_worktree_clean():
+        return True
+
+    git = find_git()
+    print("    Local changes detected in ~/devtool.")
+    print("    1. Stash changes (restore later)")
+    print("    2. Discard changes and pull latest")
+    while True:
+        choice = input("    Select [1]: ").strip()
+        if choice == "":
+            choice = "1"
+        if choice not in ("1", "2"):
+            print("    Invalid.")
+            continue
+
+        if choice == "1":
+            r = subprocess.run(
+                [git, "-C", str(DEVTOOL_DIR), "stash"],
+                capture_output=True, text=True)
+            if r.returncode == 0:
+                print("    Changes stashed.")
+                return True
+            else:
+                print(f"    Stash failed: {r.stderr.strip()}")
+                return False
+        else:
+            r = subprocess.run(
+                [git, "-C", str(DEVTOOL_DIR), "checkout", "--", "."],
+                capture_output=True, text=True)
+            if r.returncode == 0:
+                print("    Changes discarded.")
+                return True
+            else:
+                print(f"    Discard failed: {r.stderr.strip()}")
+                return False
+
+
+def _is_shallow_clone():
+    """Check if the devtool repo is a shallow clone (missing full history)."""
+    git = find_git()
+    if not git:
+        return False
+    r = subprocess.run(
+        [git, "-C", str(DEVTOOL_DIR), "rev-parse", "--is-shallow-repository"],
+        capture_output=True, text=True)
+    return r.stdout.strip() == "true"
+
+
+def _git_pull():
+    """Fetch and fast-forward to the latest remote commit."""
+    if _is_shallow_clone():
+        print("    Shallow clone detected — fetching full history...")
+        git = find_git()
+        subprocess.run(
+            [git, "-C", str(DEVTOOL_DIR), "fetch", "--unshallow"],
+            capture_output=True, text=True)
+
+    if not _clean_worktree_for_pull():
+        print("[!] Cannot pull. Please resolve manually.")
+        return False
+    git = find_git()
+    r = subprocess.run(
+        [git, "-C", str(DEVTOOL_DIR), "pull", "--ff-only"],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"[!] git pull failed: {r.stderr.strip()}")
+        return False
+    return True
 
 
 def cmd_install():
     print()
     print("[ Install ]")
+    _check_ssl()
     if not find_git():
         install_git()
         refresh_path()
@@ -251,8 +495,7 @@ def cmd_install():
 
     if DEVTOOL_DIR.exists() and (DEVTOOL_DIR / ".git").exists():
         print(f"[+] ~/devtool already exists — pulling latest...")
-        subprocess.run(["git", "-C", str(DEVTOOL_DIR), "pull", "--ff-only"],
-                      check=True, capture_output=True)
+        _git_pull()
     else:
         print(f"[+] Cloning {REPO_URL}")
         DEVTOOL_DIR.mkdir(parents=True, exist_ok=True)
@@ -278,10 +521,11 @@ def cmd_update():
     if not find_git():
         print("[!] git not found.")
         return
+    _check_ssl()
     _check_git_identity()
     print(f"[+] Pulling into ~/devtool...")
-    subprocess.run(["git", "-C", str(DEVTOOL_DIR), "pull", "--ff-only"],
-                   check=True, capture_output=True)
+    if not _git_pull():
+        return
     for pf in sorted(APPS_DIR.glob("*.py")):
         print(f"    ~ {pf.name}")
     _make_wrappers()
