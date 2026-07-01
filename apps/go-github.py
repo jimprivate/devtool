@@ -254,12 +254,6 @@ def find_repo_root(start: Path) -> Path | None:
     while p != p.parent:
         if (p / ".git").exists():
             return p
-        # Also check sibling directories (e.g. ~/Downloads/devtool-master 2/ next to ~/devtool/)
-        for sibling in p.parent.iterdir():
-            if sibling == p:
-                continue
-            if sibling.is_dir() and (sibling / ".git").exists():
-                return sibling
         p = p.parent
     return None
 
@@ -310,11 +304,79 @@ def cmd_status(repo: Path):
     print(f"    Remote: {remote or '(none)'}")
 
 
-def cmd_pull(repo: Path, msg: str):
-    """Git pull."""
-    result = subprocess.run(["git", "-C", str(repo), "pull"])
-    if result.returncode != 0:
-        print("[!] Pull failed.")
+def cmd_pull(repo: Path) -> tuple[bool, str | None]:
+    """Fetch remote HEAD + fast-forward current branch to it.
+    Returns (success, reason) where reason is None, 'not_repo_root', or 'not_git'."""
+    branch = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--show-current"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    if not branch:
+        print("[!] Detached HEAD — pull needs an active branch.")
+        return False, None
+
+    r_fetch = subprocess.run(
+        ["git", "-C", str(repo), "fetch", "origin"],
+        capture_output=True, text=True,
+    )
+    if r_fetch.returncode != 0:
+        print(f"[!] Fetch failed:\n{r_fetch.stderr.strip()}")
+        return False, None
+
+    r_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "origin/HEAD"],
+        capture_output=True, text=True,
+    )
+    if r_sha.returncode != 0:
+        r_ls = subprocess.run(
+            ["git", "-C", str(repo), "ls-remote", "origin", "HEAD"],
+            capture_output=True, text=True,
+        )
+        if r_ls.returncode != 0:
+            print("[!] Cannot resolve remote HEAD.")
+            return False, None
+        remote_sha = r_ls.stdout.split()[0]
+    else:
+        remote_sha = r_sha.stdout.strip()
+
+    local_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    if local_sha == remote_sha:
+        print("[i] Already up to date.")
+        return True, None
+
+    ahead = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--count", f"{remote_sha}..HEAD"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    behind = subprocess.run(
+        ["git", "-C", str(repo), "rev-list", "--count", f"HEAD..{remote_sha}"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    if behind != "0" and ahead != "0":
+        print(f"[!] Branches have diverged ({ahead} ahead, {behind} behind remote).")
+        print("    Resolve locally or force-reset: git reset --hard origin/HEAD")
+        return False, None
+
+    if behind != "0":
+        print(f"[i] Pulling {behind} new commit(s) into {branch}...")
+        r_ff = subprocess.run(
+            ["git", "-C", str(repo), "merge", "--ff-only", remote_sha],
+            capture_output=True, text=True,
+        )
+        if r_ff.returncode == 0:
+            print(r_ff.stdout.strip() or "[+] Done.")
+        else:
+            print(f"[!] Merge failed:\n{r_ff.stderr.strip()}")
+        return True, None
+    else:
+        print(f"[i] {ahead} commit(s) ahead of remote (not pushed yet).")
+        return True, None
 
 
 def _get_remote_url(repo: Path) -> str | None:
@@ -782,14 +844,15 @@ def _handle_large_files(repo: Path, big: list[tuple[str, float]]) -> bool:
         return False
     if choice == "1":
         gi = repo / ".gitignore"
-        existing = gi.read_text(encoding="utf-8", errors="ignore").splitlines() if gi.exists() else []
+        raw = gi.read_text(encoding="utf-8", errors="ignore") if gi.exists() else ""
+        existing = raw.splitlines()
         added = []
         for rel, _ in big:
             if rel not in existing:
                 added.append(rel)
         if added:
             with gi.open("a", encoding="utf-8") as f:
-                if existing and not existing[-1].endswith(""):
+                if raw and not raw.endswith("\n"):
                     f.write("\n")
                 for rel in added:
                     f.write(rel + "\n")
@@ -1529,18 +1592,32 @@ def interactive():
     token, username = get_account()
     print()
 
-    repo = find_repo_root(Path.cwd())
+    here = Path.cwd()
+    repo = find_repo_root(here)
 
     if repo:
+        # Already in a git repo
         repo = _resolve_and_confirm_recursive(repo)
         if repo is None:
             print("Aborted.")
             return
     else:
-        print("[i] Not in a git repo — pick one to work with.")
+        # Not a git repo — offer to pick and init/clone into current dir
+        print(f"[i] Not in a git repo — pick one to work with.")
+        print(f"  cwd: {here}")
         print("  [L] Pick from local repos (scan ~/devtool siblings)")
         print("  [G] Pick from GitHub repos (your account)")
-        sub = input("  Source [L/g]: ").strip().lower()
+        print("  [O] Other repos (local + GitHub combined)")
+        print("  [I] Init here (create new remote repo + git init + push)")
+        sub = input("  Source [L/g/O/i]: ").strip().lower()
+        if sub == "i":
+            name = input("Repo name: ").strip()
+            if not name:
+                print("[!] Repo name required.")
+                return
+            priv = input("Private? [Y/n]: ").strip().lower() != "n"
+            cmd_init(name, priv)
+            return
         if sub == "g":
             target = _pick_github_repo(visibility="all", allow_delete=False)
             if not target:
@@ -1548,56 +1625,67 @@ def interactive():
             owner, name = target.split("/", 1)
             local = _find_local_clone_for(owner, name)
             if local:
-                repo = _resolve_and_confirm_recursive(local)
-                if repo is None:
-                    return
-            else:
-                print(f"[i] No local clone of {target} found.")
-                print(f"  [C] Clone it to ~/devtool/{name}")
-                print(f"  [I] Init current dir ({Path.cwd().name}/) and push to {target}")
-                print(f"  [0] Cancel")
-                how = input("  Clone or init? [C/I/0]: ").strip().lower()
-                if how == "c":
-                    dest = Path.home() / name
-                    if dest.exists():
-                        print(f"[!] {dest} already exists.")
-                        return
-                    rc, _ = _run_streaming(["git", "clone", f"https://github.com/{target}.git", str(dest)])
-                    if rc == 0:
-                        repo = dest
-                    else:
-                        print("[!] Clone failed.")
-                        return
-                elif how == "i":
-                    here = Path.cwd()
+                print(f"[i] Found local clone: {local}")
+                if input(f"  Use cwd ({here}) instead? This will DELETE contents of cwd and clone fresh. [y/N]: ").strip().lower() in ("y", "yes"):
                     if (here / ".git").exists():
-                        print("[!] This directory is already a git repo.")
+                        print("[!] Already a git repo.")
                         return
-                    rc0, _ = _run_streaming(["git", "-C", str(here), "init"])
-                    if rc0 != 0:
-                        print("[!] git init failed.")
+                    has_files = any(f.name != '.DS_Store' for f in here.iterdir())
+                    if has_files:
+                        import shutil
+                        for item in here.iterdir():
+                            if item.name != '.DS_Store':
+                                if item.is_dir():
+                                    shutil.rmtree(item)
+                                else:
+                                    item.unlink()
+                    rc, _ = _run_streaming(["git", "clone", f"https://github.com/{target}.git", str(here)])
+                    if rc == 0:
+                        print(f"  [+] Cloned {target} into {here}")
+                        repo = here
+                    else:
+                        print("  [!] Clone failed.")
                         return
-                    rc1, _ = _run_streaming(["git", "-C", str(here), "remote", "add", "origin", f"https://github.com/{target}.git"])
-                    if rc1 != 0:
-                        print("[!] git remote add failed.")
-                        return
-                    msg = input("  Commit message: ").strip() or "initial commit"
-                    rc2, _ = _run_streaming(["git", "-C", str(here), "add", "."])
-                    if rc2 != 0:
-                        print("[!] git add failed.")
-                        return
-                    rc3, _ = _run_streaming(["git", "-C", str(here), "commit", "-m", msg])
-                    if rc3 != 0:
-                        print("[!] git commit failed.")
-                        return
-                    rc4, _ = _run_streaming(["git", "-C", str(here), "push", "-u", "origin", "HEAD"])
-                    if rc4 != 0:
-                        print("[!] git push failed.")
-                        return
-                    print(f"[+] Pushed {here.name} to {target}")
-                    repo = here
                 else:
+                    print(f"  Using local clone: {local}")
+                    repo = _resolve_and_confirm_recursive(local)
+                    if repo is None:
+                        return
+            elif (here / ".git").exists():
+                print("[!] This directory is already a git repo.")
+                return
+            # Check if directory has files
+            has_files = any(f.name != '.DS_Store' for f in here.iterdir())
+            if has_files:
+                if input(f"  Directory not empty. Clone {target} here? This will DELETE all files! [y/N]: ").strip().lower() not in ("y", "yes"):
                     return
+                import shutil
+                for item in here.iterdir():
+                    if item.name != '.DS_Store':
+                        if item.is_dir():
+                            shutil.rmtree(item)
+                        else:
+                            item.unlink()
+            rc, _ = _run_streaming(["git", "clone", f"https://github.com/{target}.git", str(here)])
+            if rc == 0:
+                print(f"  [+] Cloned {target} into {here}")
+                repo = here
+            else:
+                print("  [!] Clone failed.")
+                return
+        elif sub == "o":
+            new_repo = _pick_combined_repo(Path.home() / ".devtool-placeholder")
+            if new_repo is None:
+                return
+            if new_repo == "__init__":
+                name = input("Repo name: ").strip()
+                if not name:
+                    print("[!] Repo name required.")
+                    return
+                priv = input("Private? [Y/n]: ").strip().lower() != "n"
+                cmd_init(name, priv)
+                return
+            repo = new_repo
         else:
             picked = _pick_repo()
             if picked is None:
@@ -1621,21 +1709,48 @@ def interactive():
 
 def _action_menu(repo: Path):
     """Show the action menu for a confirmed local repo and dispatch."""
+    here = Path.cwd()
     info = _repo_info(repo)
-    header = f"[ {repo.name} ]  {info}\n[ What to do? ]"
+    header = f"[ {repo.name} ]  {info}\n[ cwd: {here} ]\n[ What to do? ]"
     choices = [
         ("Push (commit + push)", "push", "Stage all + commit with a message + push to remote"),
         ("Pull", "pull", "Fetch and merge latest changes from remote"),
         ("Status", "status", "Show uncommitted changes and remote state"),
         ("Switch repo", "switch", "Pick a different git repo to work with (local or GitHub)"),
+        ("Clone new", "clone", "Clone a GitHub repo into a fresh directory"),
         ("Wipe remote history", "wipe", "Destructive: replace all GitHub history with a single empty commit"),
         ("Delete repo", "delete", "Destructive: PERMANENTLY delete the repo from GitHub"),
     ]
     choice = show_menu(choices, header)
-    action = ["push", "pull", "status", "switch", "wipe", "delete"][choice - 1]
+    action = ["push", "pull", "status", "switch", "clone", "wipe", "delete"][choice - 1]
 
     if action == "status":
         cmd_status(repo)
+        return
+    if action == "clone":
+        target = _pick_github_repo(visibility="all", allow_delete=False)
+        if not target:
+            return
+        here = Path.cwd()
+        if (here / ".git").exists():
+            print("[!] Already a git repo. Use Pull instead.")
+            return
+        has_files = any(f.name != '.DS_Store' for f in here.iterdir())
+        if has_files:
+            if input(f"  Directory not empty. Clone {target} here? This will DELETE all files! [y/N]: ").strip().lower() not in ("y", "yes"):
+                return
+            import shutil
+            for item in here.iterdir():
+                if item.name != '.DS_Store':
+                    if item.is_dir():
+                        shutil.rmtree(item)
+                    else:
+                        item.unlink()
+        rc, _ = _run_streaming(["git", "clone", f"https://github.com/{target}.git", str(here)])
+        if rc == 0:
+            print(f"  [+] Cloned {target} into {here}")
+        else:
+            print("  [!] Clone failed.")
         return
     if action == "wipe":
         cmd_wipe_remote(repo)
@@ -1646,12 +1761,12 @@ def _action_menu(repo: Path):
             cmd_delete(target)
         return
     if action == "switch":
-        # Ask: scan local siblings, or fetch from GitHub?
         print()
         print("  [L] List local repos (scan ~/devtool siblings)")
         print("  [G] List GitHub repos (your account)")
+        print("  [O] Other repos (local + GitHub combined)")
         print("  [0] Cancel")
-        sub = input("  Pick source [L/g]: ").strip().lower()
+        sub = input("  Pick source [L/g/O]: ").strip().lower()
         if sub in ("", "l"):
             repo = _pick_repo()
             if repo is None or repo == "__init__":
@@ -1663,7 +1778,6 @@ def _action_menu(repo: Path):
             target = _pick_github_repo(visibility="all", allow_delete=False)
             if not target:
                 return
-            # Find matching local clone (by remote URL), otherwise offer to clone.
             owner, name = target.split("/", 1)
             local = _find_local_clone_for(owner, name)
             if local:
@@ -1673,10 +1787,10 @@ def _action_menu(repo: Path):
             else:
                 print(f"[i] No local clone of {target} found.")
                 if input("    Clone it now? [Y/n]: ").strip().lower() in ("", "y", "yes"):
-                    dest = Path.home() / name
-                    if dest.exists():
-                        print(f"[!] {dest} already exists.")
-                        return
+                    dest = Path.cwd()
+                    if dest.exists() and any(f.name != '.DS_Store' for f in dest.iterdir()):
+                        if input(f"    {dest} not empty. Delete contents and clone? [y/N]: ").strip().lower() not in ("y", "yes"):
+                            return
                     rc, _ = _run_streaming(["git", "clone", f"https://github.com/{target}.git", str(dest)])
                     if rc == 0:
                         repo = dest
@@ -1685,16 +1799,237 @@ def _action_menu(repo: Path):
                         return
                 else:
                     return
+        elif sub == "o":
+            new_repo = _pick_combined_repo(repo)
+            if new_repo is None or new_repo == "__init__":
+                return
+            repo = _resolve_and_confirm_recursive(new_repo)
+            if repo is None:
+                return
         else:
             return
         _action_menu(repo)
         return
     if action in ("push", "pull"):
+        target_repo = find_repo_root(Path.cwd())
+        if not target_repo:
+            # Try to self-heal: if remote URL is known, offer to clone
+            remote_url = subprocess.run(
+                ["git", "-C", str(Path.cwd()), "remote", "get-url", "origin"],
+                capture_output=True, text=True,
+            ).stdout.strip()
+            if remote_url:
+                owner_repo = None
+                if "github.com" in remote_url:
+                    parts = remote_url.rstrip("/").split("/")
+                    if "github.com" in parts:
+                        idx = parts.index("github.com")
+                        if len(parts) > idx + 2:
+                            owner_repo = f"{parts[idx+1]}/{parts[idx+2]}".removesuffix(".git")
+                if owner_repo and input(f"  Not a git repo but remote found: {owner_repo}. Clone it here? [y/N]: ").strip().lower() in ("y", "yes"):
+                    dest = Path.cwd()
+                    import shutil
+                    for item in dest.iterdir():
+                        if item.name not in (".git", ".DS_Store"):
+                            if item.is_dir():
+                                shutil.rmtree(item)
+                            else:
+                                item.unlink()
+                    rc, _ = _run_streaming(
+                        ["git", "clone", remote_url, "."]
+                    )
+                    if rc == 0:
+                        print(f"  [+] Cloned into {dest}")
+                    else:
+                        print("  [!] Clone failed.")
+                    return
+            print("[!] Not in a git repo. Switch to one first.")
+            return
         msg = input("Commit message: ").strip() or ("update" if action == "push" else "")
         if action == "push":
-            cmd_push(repo, msg)
+            cmd_push(target_repo, msg)
         else:
-            cmd_pull(repo, msg)
+            ok, _ = cmd_pull(target_repo)
+            if not ok:
+                print("  Run 'C' (Clone new) from the menu to start fresh.")
+
+
+def _pick_combined_repo(current: Path) -> Path | Literal["__init__"] | None:
+    """Picker that leads with GitHub repos; local scan as a secondary section.
+    current is the already-confirmed repo — shown as (current).
+    Returns the chosen Path, '__init__', or None."""
+    token, me = get_account()
+    gh_repos = _list_github_repos(token, affiliation="owner,collaborator,organization_member",
+                                  visibility="all")
+
+    # Sort: owner first, then by last push
+    import datetime as _dt
+    def _gh_key(r):
+        is_owner = r.get("owner", {}).get("login", "") == me
+        pushed = (r.get("pushed_at") or r.get("updated_at") or "")[:19]
+        try:
+            ts = int(_dt.datetime.strptime(pushed, "%Y-%m-%dT%H:%M:%S").timestamp())
+        except ValueError:
+            ts = 0
+        return (0 if is_owner else 1, -ts)
+    gh_repos.sort(key=_gh_key)
+
+    # Build local URL set so we can mark GH repos as [local]
+    local_repos = _find_all_repos()
+    local_urls: set[str] = set()
+    local_by_name: dict[str, Path] = {}
+    for rp, name, url in local_repos:
+        if url != "(no remote)":
+            local_urls.add(url.removesuffix(".git"))
+        local_by_name[name] = rp
+
+    print()
+    print("[ Pick a repo ]")
+    print("-" * 90)
+    gh_idx_map: dict[int, dict] = {}
+    local_idx_map: dict[int, Path] = {}
+
+    print("  --- GitHub repos ---")
+    idx = 1
+    for r in gh_repos[:60]:
+        full, gh_url, vis, role = _repo_row(r, me)
+        gh_url_norm = gh_url.removesuffix(".git")
+        has_local = gh_url_norm in local_urls or full.split("/")[-1] in local_by_name
+        pushed = (r.get("pushed_at") or r.get("updated_at") or "")[:10]
+        owner_marker = " *" if role == "owner" else "  "
+        local_marker = " [local]" if has_local else ""
+        print(f"  {owner_marker}{idx}. {full}{local_marker}  [{vis}]  {pushed}")
+        gh_idx_map[idx] = r
+        idx += 1
+    if len(gh_repos) > 60:
+        print(f"      ... and {len(gh_repos) - 60} more (use G to browse all)")
+
+    if local_repos:
+        print()
+        print("  --- Local scan ---")
+        for rp, name, url in local_repos:
+            is_current = (rp.resolve() == current.resolve())
+            marker = " (current)" if is_current else ""
+            print(f"  L{idx}. {name}{marker}")
+            print(f"      {url}")
+            local_idx_map[idx] = rp
+            idx += 1
+
+    print()
+    print(f"  I. Init here")
+    print(f"     Create a new remote repo + git init + push local files")
+    print(f"  G. GitHub repos (full paginated list)")
+    print(f"  L. Local repos only")
+    print(f"  C. Clone new")
+    print(f"     Enter owner/repo → clone into a new directory")
+    print(f"  0. Exit")
+    print()
+    print("  (* = you are the owner  |  [local] = already cloned locally)")
+
+    while True:
+        val = input("Select: ").strip().lower()
+        if val == "0":
+            sys.exit(0)
+        if val == "i":
+            return "__init__"
+        if val == "c":
+            target = input("  owner/repo: ").strip()
+            if not target or "/" not in target:
+                print("  [!] Format must be owner/repo")
+                continue
+            dest_str = input(f"  Clone into [{target.split('/')[-1]}]: ").strip()
+            if not dest_str:
+                dest_str = target.split("/")[-1]
+            dest = Path(dest_str).expanduser().resolve()
+            if dest.exists():
+                print(f"  [!] {dest} already exists.")
+                continue
+            dest.mkdir(parents=True, exist_ok=True)
+            rc, _ = _run_streaming(
+                ["git", "clone", f"https://github.com/{target}.git", str(dest)]
+            )
+            if rc == 0:
+                print(f"  [+] Cloned into {dest}")
+                return dest
+            # Clean up on failure
+            import shutil
+            shutil.rmtree(dest, ignore_errors=True)
+            print("  [!] Clone failed.")
+            continue
+        if val == "g":
+            target = _pick_github_repo(visibility="all", allow_delete=False)
+            if not target:
+                return None
+            owner, name = target.split("/", 1)
+            local = _find_local_clone_for(owner, name)
+            here = Path.cwd()
+            if local:
+                print(f"[i] Found local clone: {local}")
+                if input(f"  Use cwd ({here}) instead? This will clone fresh to cwd. [y/N]: ").strip().lower() in ("y", "yes"):
+                    dest = here
+                    if dest.exists() and any(f.name != '.DS_Store' for f in dest.iterdir()):
+                        if input(f"    {dest} not empty. Delete contents and clone? [y/N]: ").strip().lower() not in ("y", "yes"):
+                            return None
+                    rc, _ = _run_streaming(["git", "clone", f"https://github.com/{target}.git", str(dest)])
+                    if rc == 0:
+                        return dest
+                    print("[!] Clone failed.")
+                    return None
+                else:
+                    return local
+            print(f"[i] No local clone of {target} found.")
+            if input("    Clone it now? [Y/n]: ").strip().lower() in ("", "y", "yes"):
+                dest = Path.cwd()
+                if dest.exists() and any(f.name != '.DS_Store' for f in dest.iterdir()):
+                    if input(f"    {dest} not empty. Delete contents and clone? [y/N]: ").strip().lower() not in ("y", "yes"):
+                        return None
+                rc, _ = _run_streaming(["git", "clone", f"https://github.com/{target}.git", str(dest)])
+                if rc == 0:
+                    return dest
+                print("[!] Clone failed.")
+            return None
+        if val == "l":
+            picked = _pick_repo()
+            if picked is None or picked == "__init__":
+                return None
+            return picked
+        try:
+            n = int(val)
+            if n in gh_idx_map:
+                r = gh_idx_map[n]
+                owner, name = r["full_name"].split("/", 1)
+                local = _find_local_clone_for(owner, name)
+                here = Path.cwd()
+                if local:
+                    print(f"[i] Found local clone: {local}")
+                    if input(f"  Use cwd ({here}) instead? This will clone fresh to cwd. [y/N]: ").strip().lower() in ("y", "yes"):
+                        dest = here
+                        if dest.exists() and any(f.name != '.DS_Store' for f in dest.iterdir()):
+                            if input(f"    {dest} not empty. Delete contents and clone? [y/N]: ").strip().lower() not in ("y", "yes"):
+                                return None
+                        rc, _ = _run_streaming(["git", "clone", r["html_url"], str(dest)])
+                        if rc == 0:
+                            return dest
+                        print("[!] Clone failed.")
+                        return None
+                    else:
+                        return local
+                print(f"[i] No local clone of {r['full_name']} found.")
+                if input("    Clone it now? [Y/n]: ").strip().lower() in ("", "y", "yes"):
+                    dest = Path.cwd()
+                    if dest.exists() and any(f.name != '.DS_Store' for f in dest.iterdir()):
+                        if input(f"    {dest} not empty. Delete contents and clone? [y/N]: ").strip().lower() not in ("y", "yes"):
+                            return None
+                    rc, _ = _run_streaming(["git", "clone", r["html_url"], str(dest)])
+                    if rc == 0:
+                        return dest
+                    print("[!] Clone failed.")
+                return None
+            if n in local_idx_map:
+                return local_idx_map[n]
+        except ValueError:
+            pass
+        print("Invalid, try again.")
 
 
 def _resolve_and_confirm_recursive(r) -> Path | None:
@@ -1706,8 +2041,16 @@ def _resolve_and_confirm_recursive(r) -> Path | None:
             return r
         if result is None:
             return None
-        picked = _pick_repo()
-        if picked is None or picked == "__init__":
+        picked = _pick_combined_repo(r)
+        if picked is None:
+            return None
+        if picked == "__init__":
+            name = input("Repo name: ").strip()
+            if not name:
+                print("[!] Repo name required.")
+                return None
+            priv = input("Private? [Y/n]: ").strip().lower() != "n"
+            cmd_init(name, priv)
             return None
         r = picked
 
@@ -1762,6 +2105,8 @@ def main():
     args = parser.parse_args()
 
     if not args.command:
+        print(f"  cwd: {Path.cwd()}")
+        print()
         interactive()
         return
 
@@ -1787,7 +2132,7 @@ def main():
         if not repo:
             print("[!] Not in a git repository.")
             sys.exit(1)
-        cmd_pull(repo, "")
+        cmd_pull(repo)
 
     elif cmd == "new":
         if not args.arg:
